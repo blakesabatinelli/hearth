@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+**/dist/
+**/build/
+
+# TypeScript
+*.tsbuildinfo
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Trash
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local config (NOT to be committed)
+.config.local/
+hearth.local.yaml
+openclaw.local.json
+
+# Cache / scratch
+.cache/
+.turbo/
+.parcel-cache/
+.eslintcache
+
+# Coverage
+coverage/
+**/coverage/
+
+# Model artifacts (NEVER commit weights, plan section 11)
+models/*.bin
+models/*.gguf
+models/*.safetensors
+models/*.pt
+models/*.pth
+
+# Generated receipts fixtures
+fixtures/*.sqlite
+fixtures/*.db
+
+# Pre-commit hook caches
+.git/hooks/*.local

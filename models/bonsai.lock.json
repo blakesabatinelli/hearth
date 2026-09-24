@@ -1,0 +1,59 @@
+{
+  "$schema": "./bonsai.lock.schema.json",
+  "lock_version": 1,
+  "generated_at": "2026-09-24",
+  "generated_by": "hermes hand-off",
+  "model": {
+    "family": "bonsai",
+    "variant": "bonsai-27b-1bit",
+    "status": "TBD - real weights deferred per hearth-build Decision 1 (2026-09-24)",
+    "checkpoint_revision": "TBD",
+    "primary_source": {
+      "kind": "prismml",
+      "url": "https://github.com/PrismML-Eng/Bonsai-demo",
+      "license": "TBD - inspect repo before redistributing weights"
+    },
+    "artifacts": [
+      {
+        "role": "weights",
+        "filename": "TBD",
+        "sha256": "TBD",
+        "size_bytes": null
+      },
+      {
+        "role": "tokenizer",
+        "filename": "TBD",
+        "sha256": "TBD"
+      },
+      {
+        "role": "chat_template",
+        "filename": "TBD",
+        "sha256": "TBD"
+      }
+    ],
+    "context_window_tokens": 4096,
+    "output_budget_tokens": 512,
+    "supported_schema_mechanisms": ["outlines", "guidance", "grammar"],
+    "host": {
+      "architecture": "TBD - measure at Stage 0 benchmark",
+      "backend": "TBD - llama.cpp / ollama / prismml-runtime"
+    },
+    "evaluation": {
+      "minimum_cases": 200,
+      "labeled_set_path": "eval/commands/",
+      "metric_targets": {
+        "exact_supported_unambiguous_min": 0.95,
+        "wrong_target_rate_max": 0.0,
+        "dropped_exclusion_rate_max": 0.0,
+        "abstention_on_unsupported": "report separately, must be high"
+      }
+    }
+  },
+  "notes": [
+    "Real Bonsai 27B weights and serving-runtime round-trip deferred per Decision 1 (2026-09-24): build behind BonsaiProvider interface, ship mock-bonsai for tests/CI, mark Stage 0 gate partial until real evidence exists.",
+    "Until weights are available, hearth-control uses the mock-bonsai adapter. mock-bonsai must validate server-side schema, return synthetic proposals for in-fixture requests, and never claim to be a real model.",
+    "Plan section 7 prohibits Qwen or cloud fallback. This lock file's mock-bonsai is a local test double, not a model substitution.",
+    "No 'latest' tag references in released profiles (plan section 7). No weights committed to the Git repo (plan section 11).",
+    "When real weights become available: populate sha256 fields from the PrismML artifact manifest, re-run Stage 0 gate, change status from 'TBD' to 'pinned-pending-evidence' then 'pinned' after local round-trip passes."
+  ]
+}

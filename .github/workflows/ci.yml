@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: lint + typecheck + test + portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d4ee9c464c8a83f8
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+
+      - name: Setup Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint placeholder
+        run: |
+          echo 'lint stub; real lint config in Stage 1'
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Test
+        run: pnpm -r --if-present test
+
+      - name: Verify Bonsai lock structure
+        run: node scripts/verify-bonsai-lock.mjs
+
+      - name: Verify portability
+        run: node scripts/verify-portability.mjs
+
+      - name: Secret scan via gitleaks
+        uses: gitleaks/gitleaks-action@9b32f84186b4a8fcb38da27c7b8eb3f2f3c2c0fb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  no-live-credentials:
+    name: ensure no live home credentials committed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d4ee9c464c8a83f8
+      - name: Verify no JWT-shaped strings in source
+        run: |
+          set -e
+          if grep -rE 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' \
+             --include='*.ts' --include='*.mjs' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.md' \
+             --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
+             . ; then
+            echo '::error::Found JWT-shaped string in source - may be a HA token. Verify and remove if so.'
+            exit 1
+          fi
+      - name: Verify no private IPs in source
+        run: |
+          set -e
+          if grep -rE '\b(10|192\.168|127)\.[0-9]+\.[0-9]+\.[0-9]+\b' \
+             --include='*.ts' --include='*.mjs' --include='*.json' --include='*.yaml' --include='*.yml' \
+             --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
+             . ; then
+            echo '::error::Found private IP. Use 0.0.0.0 in docs and config templates, real hostnames in installation-local config.'
+            exit 1
+          fi
