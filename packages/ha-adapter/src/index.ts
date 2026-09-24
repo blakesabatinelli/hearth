@@ -14,7 +14,6 @@ export {
   FakeHAAdapter,
   HAConnectionPool,
   loadDefaultFixture,
-  type FakeHADispatchAck,
   type FixtureSeed,
   type ProviderKey,
 } from './adapter.js';

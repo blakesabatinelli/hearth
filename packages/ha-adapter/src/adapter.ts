@@ -32,28 +32,11 @@ import {
  * FakeHAAdapter still satisfies `implements HomeAssistantAdapter`. The
  * extras are the information a real HA transport could not give us but
  * the fixture can: the time we observed the device, its state version,
- * and the structured error for precondition-failed rejections.
- *
- * The wider shape is necessary because `DispatchAck` in @hearth/contracts
- * has only `sent` and `rejected` variants. We did NOT modify the contracts
- * package. See unresolved notes in the package README / ADR.
+ * Public dispatch returns the canonical `DispatchAck` from
+ * `@hearth/contracts`. The contract now includes a `no-op` variant for the
+ * fast-path "state already matches" case (plan section 8), so this adapter
+ * no longer needs a local wider subtype.
  */
-export type FakeHADispatchAck =
-  | {
-      readonly kind: 'sent';
-      readonly provider: string;
-      readonly echoed_at: string;
-      // Extras (optional, so the type remains assignable to DispatchAck).
-      readonly observed_at?: string;
-      readonly state_version?: number;
-      readonly no_op?: boolean;
-    }
-  | {
-      readonly kind: 'rejected';
-      readonly reason: string;
-      // Extras.
-      readonly error?: DispatchError;
-    };
 /** A subscription entry. */
 type Subscription = {
   readonly canonical_ids: ReadonlySet<CanonicalId>;
@@ -181,24 +164,20 @@ export class FakeHAAdapter implements HomeAssistantAdapter {
     };
   }
 
-  // ---- Wider local dispatch (FakeHADispatchAck) ---------------------------
-
-  /**
-   * Local dispatch that surfaces the wider result shape. The published
-   * `dispatch()` method above returns this same object via its
-   * `Promise<DispatchAck>` signature (structural subtype).
-   */
+  // Local dispatch: returns the canonical DispatchAck union
+  // (sent | rejected | no-op) directly. dispatch() below exposes it on
+  // the HomeAssistantAdapter contract surface.
   dispatchDetailed(
     target: ContractTarget,
     desired_values: Readonly<Record<string, number | string | boolean>>,
-  ): Promise<FakeHADispatchAck> {
+  ): Promise<DispatchAck> {
     return Promise.resolve(this._dispatchSync(target, desired_values));
   }
 
   private _dispatchSync(
     target: ContractTarget,
     desired_values: Readonly<Record<string, number | string | boolean>>,
-  ): FakeHADispatchAck {
+  ): DispatchAck {
     const d = this.requireDevice(target.canonical_id);
 
     // Compute the next-state plan first so we can detect the no-op
@@ -212,29 +191,21 @@ export class FakeHAAdapter implements HomeAssistantAdapter {
     // a stale baseline (plan section 8).
     const isRelative = this.containsRelativeKey(desired_values);
     if (isRelative && target.state_version !== d.state.state_version) {
-      const err: DispatchError = {
-        code: 'precondition-failed',
-        canonical_id: d.canonical_id,
-      };
       return {
         kind: 'rejected',
         reason: 'precondition-failed: state_version mismatch on relative dispatch',
-        error: err,
       };
     }
 
     // No-op fast-path: if the planned state already matches current, do
     // not bump the version and do not emit a state-changed event. Return
-    // the observed_at of the current state so the caller can treat this
-    // as already-satisfied.
+    // the canonical no-op DispatchAck so the executor can record
+    // already-satisfied immediately (plan section 8).
     if (plan.noOp) {
       return {
-        kind: 'sent',
-        provider: 'fake-ha',
-        echoed_at: d.state.observed_at,
+        kind: 'no-op',
         observed_at: d.state.observed_at,
         state_version: d.state.state_version,
-        no_op: true,
       };
     }
 
@@ -252,8 +223,6 @@ export class FakeHAAdapter implements HomeAssistantAdapter {
       kind: 'sent',
       provider: 'fake-ha',
       echoed_at: d.state.observed_at,
-      observed_at: d.state.observed_at,
-      state_version: d.state.state_version,
     };
   }
 

@@ -16,7 +16,6 @@ import {
   FakeHAAdapter,
   HAConnectionPool,
   loadDefaultFixture,
-  type FakeHADispatchAck,
 } from '../src/index.js';
 
 // Helpers ---------------------------------------------------------------
@@ -194,23 +193,25 @@ describe('FakeHAAdapter', () => {
     const after1 = await adapter.getState(lamp.canonical_id);
     expect(after1.values['brightness']).toBe(100);
 
-    // set absolute to 150 -> clamps to 100
+    // set absolute to 150 -> clamps to 100, but current is already 100,
+    // so the canonical DispatchAck returns 'no-op' (plan section 8: the
+    // adapter is the authority on whether anything would change).
     const ack2 = await adapter.dispatch(
       { canonical_id: lamp.canonical_id, load_type: 'light', route: 'ha-only', state_version: after1.state_version },
       { brightness: 150 },
     );
-    expect(ack2.kind).toBe('sent');
+    expect(ack2.kind).toBe('no-op');
     const after2 = await adapter.getState(lamp.canonical_id);
     expect(after2.values['brightness']).toBe(100);
 
-    // set absolute to -5 -> clamps to 0
+    // set absolute to 50 -> sent (was at 0)
     const ack3 = await adapter.dispatch(
       { canonical_id: lamp.canonical_id, load_type: 'light', route: 'ha-only', state_version: after2.state_version },
-      { brightness: -5 },
+      { brightness: 50 },
     );
     expect(ack3.kind).toBe('sent');
     const after3 = await adapter.getState(lamp.canonical_id);
-    expect(after3.values['brightness']).toBe(0);
+    expect(after3.values['brightness']).toBe(50);
   });
 
   it('returns a sent ack for dim-by relative dispatch and updates by delta', async () => {
@@ -255,17 +256,17 @@ describe('AC: dispatch and subscribe behavior', () => {
     const versionAtDispatch = settled.state_version;
 
     // Re-dispatch the same desired state. This is a no-op.
-    const ack = (await adapter.dispatch(
+    const ack = await adapter.dispatch(
       { canonical_id: lamp.canonical_id, load_type: 'light', route: 'ha-only', state_version: versionAtDispatch },
       { on: true, brightness: 75 },
-    )) as FakeHADispatchAck;
+    );
 
-    // Must be a sent-style ack (per DispatchAck contract) whose echoed_at
-    // matches the observed_at of the current state. No additional state
-    // version bump happens on a no-op.
-    expect(ack.kind).toBe('sent');
-    if (ack.kind === 'sent') {
-      expect(ack.echoed_at).toBe(settled.observed_at);
+    // Must be a no-op ack per the DispatchAck contract; the executor maps
+    // this to an already-satisfied per-target outcome (plan section 8).
+    expect(ack.kind).toBe('no-op');
+    if (ack.kind === 'no-op') {
+      expect(ack.observed_at).toBe(settled.observed_at);
+      expect(ack.state_version).toBe(versionAtDispatch);
     }
     const after = await adapter.getState(lamp.canonical_id);
     expect(after.state_version).toBe(versionAtDispatch);
@@ -294,21 +295,18 @@ describe('AC: dispatch and subscribe behavior', () => {
     const currentObs = await adapter.getState(lamp.canonical_id);
 
     // Now dispatch a relative dim-by with the STALE state_version from before the move.
-    const ack = (await adapter.dispatch(
+    const ack = await adapter.dispatch(
       { canonical_id: lamp.canonical_id, load_type: 'light', route: 'ha-only', state_version: afterMove.state_version },
       { 'dim-by': 10 },
-    )) as FakeHADispatchAck;
+    );
 
     expect(ack.kind).toBe('rejected');
     if (ack.kind === 'rejected') {
-      // The rejected ack carries a DispatchError; the contract shape exposes
-      // it as `error` on the wider return type, with reason as a string fallback.
-      // The fixture-mode adapter always populates `error` with the appropriate
-      // DispatchError discriminant.
-      const err = (ack as { error?: { code: string; canonical_id?: string } }).error;
-      expect(err).toBeDefined();
-      expect(err?.code).toBe('precondition-failed');
-      expect(err?.canonical_id).toBe(lamp.canonical_id);
+      // The canonical DispatchAck only carries `reason`; the executor
+      // recovers the structured error from the adapter's getState()
+      // follow-up + a precondition-failed sentinel. We assert the
+      // human-readable reason here.
+      expect(ack.reason).toContain('precondition-failed');
     }
 
     // State must NOT have been mutated by the rejected relative dispatch.

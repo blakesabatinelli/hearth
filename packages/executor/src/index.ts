@@ -747,6 +747,16 @@ export class ContractExecutor {
           continue;
         }
 
+        if (ack.kind === 'no-op') {
+          // Adapter explicitly told us state already matched; treat as
+          // already-satisfied (a fresh observation from the adapter's POV).
+          per_target[target.canonical_id] = {
+            kind: 'already-satisfied',
+            observed_at: ack.observed_at,
+          };
+          continue;
+        }
+
         // Wait for a fresh observation up to a short bounded window. The
         // adapter controls real timing; we give the watcher a chance to
         // deliver before falling back.
