@@ -1,0 +1,18 @@
+{
+  "name": "Hearth",
+  "short_name": "Hearth",
+  "description": "Hearth home control PWA",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1f1f23",
+  "theme_color": "#1f1f23",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
