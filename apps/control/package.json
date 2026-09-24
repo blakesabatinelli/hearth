@@ -1,0 +1,34 @@
+{
+  "name": "@hearth/control",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "hearth-control": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@fastify/cookie": "11.0.1",
+    "@fastify/csrf-protection": "7.0.2",
+    "@hearth/contracts": "workspace:*",
+    "@hearth/executor": "workspace:*",
+    "@hearth/ha-adapter": "workspace:*",
+    "@hearth/interpreter": "workspace:*",
+    "@hearth/registry": "workspace:*",
+    "fastify": "5.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.12",
+    "@types/node": "22.10.5",
+    "better-sqlite3": "11.7.0",
+    "typescript": "5.6.3",
+    "vitest": "2.1.9"
+  }
+}
