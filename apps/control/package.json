@@ -19,6 +19,7 @@
     "@fastify/csrf-protection": "7.0.2",
     "@hearth/contracts": "workspace:*",
     "@hearth/executor": "workspace:*",
+    "@hearth/extractor": "workspace:*",
     "@hearth/ha-adapter": "workspace:*",
     "@hearth/interpreter": "workspace:*",
     "@hearth/registry": "workspace:*",

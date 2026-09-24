@@ -35,6 +35,7 @@ import type {
   ExtractionProvider,
   HomeAssistantAdapter,
 } from '@hearth/contracts';
+import { HearthExtractHttpClient, MockGliner2 } from '@hearth/extractor';
 
 import { HearthToExecutorRegistry } from './registry-adapter.js';
 import { SessionStore, COOKIE, csrfValid, readSession, setSessionCookie, clearSessionCookie, actorForRole } from './session.js';
@@ -46,14 +47,20 @@ export type WireOptions = {
   readonly adapter: HomeAssistantAdapter;
   readonly store: ExecutionStore;
   readonly clock: Clock;
-  /** Optional: GLiNER2 sidecar. If null, interpreter skips GLiNER2. */
+  /** Override GLiNER2 provider. Default: MockGliner2 (deterministic, for tests/CI). */
   readonly gliner2?: ExtractionProvider | null;
-  /** Optional: Bonsai provider. If null, interpreter skips Bonsai. */
+  /** Override Bonsai provider. Default: null (grammar + GLiNER2 only). */
   readonly bonsai?: BonsaiProvider | null;
   /** If true, every request gets the dev-default actor (no auth required). */
   readonly dev_actor?: boolean;
   /** Override session store secret (for tests). */
   readonly session_secret?: string;
+  /**
+   * If set, construct a `HearthExtractHttpClient` against this base URL
+   * instead of using MockGliner2. Allows prod to point at the real
+   * `hearth-extract` Python sidecar.
+   */
+  readonly gliner2_http_url?: string;
 };
 
 export type WiredControl = {
@@ -73,9 +80,15 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
     clock: opts.clock,
   });
 
+  // Choose the GLiNER2 provider: explicit > HTTP URL > mock.
+  const gliner2_provider: ExtractionProvider | null = opts.gliner2
+    ?? (opts.gliner2_http_url
+      ? new HearthExtractHttpClient({ base_url: opts.gliner2_http_url })
+      : new MockGliner2());
+
   const interpreter = new Interpreter({
     registry: opts.registry,
-    gliner2: opts.gliner2 ?? null,
+    gliner2: gliner2_provider,
     bonsai: opts.bonsai ?? null,
   });
 
