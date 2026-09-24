@@ -23,6 +23,7 @@ import {
 } from '@hearth/ha-adapter';
 import { RegistryOverlay } from '@hearth/registry';
 import { wireControl } from './wiring.js';
+import { Scheduler, InMemoryScheduleStore, type SchedulerOptions } from '@hearth/scheduler';
 
 async function makeStore(sqlite_path: string): Promise<ExecutionStore> {
   if (sqlite_path === ':memory:') {
@@ -82,6 +83,32 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.error('[hearth-control] reconcileOnStartup failed:', (err as Error).message);
   }
+
+  // v3.0.1: start the scheduler. In-memory only on the current store; the
+  // production deployment will swap in a SQLite-backed ScheduleStore
+  // pointing at HEARTH_SCHEDULE_DB. The scheduler picks up the live
+  // state_version through the adapter.handle getState() lookup, so the
+  // executor's stale-context check has the comparison it needs.
+  const sched_store = new InMemoryScheduleStore();
+  const sched_state: SchedulerOptions = {
+    store: sched_store,
+    executor: wired.executor,
+    registry,
+    executor_registry: wired.executor_registry,
+    clock,
+    state_lookup: async (canonical_id: string): Promise<number> => {
+      try {
+        const s = await adapter.getState(canonical_id as never);
+        return s.state_version;
+      } catch {
+        return 1;
+      }
+    },
+  };
+  const scheduler = new Scheduler(sched_state);
+  scheduler.start();
+  // eslint-disable-next-line no-console
+  console.log('[hearth-control] scheduler started (in-memory store, 30s tick)');
 
   await wired.app.listen({ port, host });
 

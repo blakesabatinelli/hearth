@@ -70,6 +70,27 @@ export type BuildContractInput = {
   readonly now: () => Date;
   /** Caller-supplied expiry in seconds (server-validated + clamped). Omit to use the default. */
   readonly expiry_seconds?: number | undefined;
+  /**
+   * v3.0.1: optional state-observation source. When provided, each resolved
+   * target carries `state_version` from `getState(canonical_id)` rather
+   * than the v3.0 placeholder of 0. The executor re-checks state_version
+   * at dispatch, so a stale value here causes a `StaleContextError`.
+   *
+   * The function MUST be a no-throwing adapter lookup (return 0 on
+   * miss if it really cannot observe).
+   */
+  readonly observed_state?: (canonical_id: string) => Promise<number>;
+  /**
+   * v3.0.1: handle relative brightness/desired-values before
+   * `desired_values` lands in the contract. Receives the desired_values
+   * from the proposal plus an `obs` snapshot of current attributes; must
+   * return the resolved absolute desired_values.
+   */
+  readonly resolve_relative?: (
+    target_canonical_id: string,
+    desired: Readonly<Record<string, number | string | boolean>>,
+    obs: Readonly<Record<string, unknown>>,
+  ) => Promise<Readonly<Record<string, number | string | boolean>>>;
 };
 
 export type BuildContractOutput = {
@@ -99,7 +120,7 @@ export async function buildContract(
   const expires_at = new Date(now().getTime() + expiry * 1000).toISOString();
 
   // Resolve all target phrases to canonical IDs.
-  const resolved: Array<{ canonical_id: CanonicalId; load_type: DeviceRecord['load_type']; route: RoutePreference; state_version: number }> = [];
+  const resolved: Array<{ canonical_id: CanonicalId; load_type: DeviceRecord['load_type']; route: RoutePreference; state_version: number; attributes: Readonly<Record<string, unknown>> }> = [];
   for (const phrase of proposal.target_phrases) {
     const matches = await resolve_phrase(phrase);
     if (matches.length === 0) {
@@ -143,13 +164,20 @@ export async function buildContract(
         },
       );
     }
+    // v3.0.1: snapshot the device's state_version + attributes at build
+    // time so the executor's stale-context check at dispatch time has a
+    // real comparison value (was hard-coded to 0 in v3.0).
+    let state_version = 0;
+    let attributes: Readonly<Record<string, unknown>> = {};
+    if (input.observed_state) {
+      state_version = await input.observed_state(dev.canonical_id);
+    }
     resolved.push({
       canonical_id: dev.canonical_id,
       load_type: dev.load_type,
       route: dev.route_preference,
-      // state_version is unknown at proposal time; the executor fetches it
-      // at dispatch time and rejects if it changed between parse and exec.
-      state_version: 0,
+      state_version,
+      attributes,
     });
   }
 
@@ -160,6 +188,18 @@ export async function buildContract(
     route: r.route,
     state_version: r.state_version,
   }));
+
+  // v3.0.1: resolve relative desired_values against observed state, so
+  // "brighter by 10" becomes "brightness = obs.brightness + 10".
+  let resolved_desired: Readonly<Record<string, number | string | boolean>> = proposal.desired_values;
+  if (input.resolve_relative && (proposal.intent_family === 'set-brightness-relative' || hasRelativeKeys(proposal.desired_values))) {
+    const out: Record<string, number | string | boolean> = {};
+    for (const r of resolved) {
+      const absolute = await input.resolve_relative(r.canonical_id, proposal.desired_values, r.attributes);
+      Object.assign(out, absolute);
+    }
+    resolved_desired = out;
+  }
 
   const scene_version =
     proposal.intent_family === 'set-scene' || proposal.intent_family === 'routine-trigger'
@@ -189,7 +229,7 @@ export async function buildContract(
     intent_family: proposal.intent_family as IntentFamily,
     targets,
     exclusions: proposal.exclusions,
-    desired_values: proposal.desired_values,
+    desired_values: resolved_desired,
     entity_version: 1,
     scene_version,
     preconditions,
@@ -204,6 +244,65 @@ export async function buildContract(
   void idempotency_key;
   void registry;
   return { contract };
+}
+
+/**
+ * Resolve relative desired_values against observed state.
+ *
+ * Examples:
+ *   desired = { relative_brightness: '+10' }, obs = { brightness: 50 }
+ *     -> { brightness: 60 }
+ *   desired = { relative_brightness: '-5' }, obs = { brightness: 50 }
+ *     -> { brightness: 45 }
+ *   desired = { power: 'on' } (absolute) -> returned verbatim
+ *
+ * Numeric fields with no observed value default to 0. Relative strings
+ * must start with `+` or `-`; otherwise they are passed through as absolute.
+ */
+export function resolveRelativeDesiredValues(
+  desired: Readonly<Record<string, number | string | boolean>>,
+  obs: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, number | string | boolean>> {
+  const out: Record<string, number | string | boolean> = {};
+  for (const [key, raw] of Object.entries(desired)) {
+    if (!key.startsWith('relative_')) { out[key] = raw; continue; }
+    const absolute_key = key.slice('relative_'.length);
+    const current = numberOrZero(obs[absolute_key]);
+    if (typeof raw === 'string' && /^[+-]\d+(\.\d+)?$/.test(raw)) {
+      const delta = Number(raw);
+      out[absolute_key] = clampBrightness(current + delta);
+    } else if (typeof raw === 'number') {
+      out[absolute_key] = clampBrightness(current + raw);
+    } else {
+      // Cannot parse; leave absolute key at current observation.
+      out[absolute_key] = current;
+    }
+  }
+  // Also include any absolute values that were already in desired.
+  for (const [key, raw] of Object.entries(desired)) {
+    if (!key.startsWith('relative_')) out[key] = raw;
+  }
+  return out;
+}
+
+function numberOrZero(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+function clampBrightness(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+/**
+ * True if the desired_values map contains any relative key
+ * (e.g. `relative_brightness: '+10'`).
+ */
+function hasRelativeKeys(values: Readonly<Record<string, number | string | boolean>>): boolean {
+  for (const k of Object.keys(values)) {
+    if (k.startsWith('relative_')) return true;
+  }
+  return false;
 }
 
 export function ensureProposalFreshness(

@@ -229,6 +229,8 @@ export interface ExecutionStore {
   saveReceipt(receipt: Receipt): void;
   getReceipt(receipt_id: string): Receipt | null;
   getReceiptsForContract(contract_id: string): ReadonlyArray<Receipt>;
+  /** v3.0.1: list every receipt (ops introspection + scheduler assertions). */
+  allReceipts(): ReadonlyArray<Receipt>;
   /**
    * Drop a contract row. Used on supersede / cancellation cleanup.
    */
@@ -294,6 +296,10 @@ export class InMemoryExecutionStore implements ExecutionStore {
 
   public getReceiptsForContract(contract_id: string): ReadonlyArray<Receipt> {
     return Array.from(this.receipts.values()).filter((r) => r.contract_id === contract_id);
+  }
+
+  public allReceipts(): ReadonlyArray<Receipt> {
+    return Array.from(this.receipts.values());
   }
 
   public dropIdempotency(contract_id: string): void {
@@ -446,6 +452,13 @@ export class SqliteExecutionStore implements ExecutionStore {
     return rows.map((r) => JSON.parse(r.payload_json) as Receipt);
   }
 
+  public allReceipts(): ReadonlyArray<Receipt> {
+    const rows = this.db
+      .prepare(`SELECT payload_json FROM receipts`)
+      .all() as Array<{ payload_json: string }>;
+    return rows.map((r) => JSON.parse(r.payload_json) as Receipt);
+  }
+
   public dropIdempotency(contract_id: string): void {
     this.db.prepare(`DELETE FROM contracts WHERE contract_id = ?`).run(contract_id);
   }
@@ -468,7 +481,15 @@ export function contractPayloadHash(contract: Contract): string {
   const canonical = {
     actor: contract.actor,
     intent_family: contract.intent_family,
-    targets: contract.targets,
+    // v3.0.1: hash only the canonical_ids and load_types/route; state_version
+    // is an observation detail that changes between builds and is not part
+    // of the dispatch intent. Re-running the same proposal twice produces
+    // the same hash even if the observed state_version advanced.
+    targets: contract.targets.map((t) => ({
+      canonical_id: t.canonical_id,
+      load_type: t.load_type,
+      route: t.route,
+    })),
     exclusions: contract.exclusions,
     desired_values: contract.desired_values,
     entity_version: contract.entity_version,
@@ -830,6 +851,22 @@ export class ContractExecutor {
     if (existing.status === 'dispatching' || existing.status === 'pending') {
       this.store.updateStatus(contract_id, 'cancelled');
     }
+  }
+
+  /**
+   * v3.0.1: read all receipts for a given contract_id. The store is
+   * private; this is the typed accessor used by tests, scheduler
+   * integration, and ops tooling.
+   */
+  public getReceiptsForContract(contract_id: string): ReadonlyArray<Receipt> {
+    return this.store.getReceiptsForContract(contract_id);
+  }
+
+  /**
+   * v3.0.1: return every receipt in the store, in dispatch order.
+   */
+  public listReceipts(): ReadonlyArray<Receipt> {
+    return this.store.allReceipts();
   }
 
   /**

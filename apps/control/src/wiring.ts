@@ -39,8 +39,9 @@ import { HearthExtractHttpClient, MockGliner2 } from '@hearth/extractor';
 
 import { HearthToExecutorRegistry } from './registry-adapter.js';
 import { SessionStore, COOKIE, csrfValid, readSession, setSessionCookie, clearSessionCookie, actorForRole } from './session.js';
-import { buildContract, ensureProposalFreshness, type BuildContractInput } from './contract-builder.js';
+import { buildContract, ensureProposalFreshness, type BuildContractInput, resolveRelativeDesiredValues } from './contract-builder.js';
 import { mapDomainError } from './errors.js';
+import { issueReceipt, verifyReceipt, UntrustedProposalError } from './proposal-receipts.js';
 
 export type WireOptions = {
   readonly registry: HearthRegistryOverlay;
@@ -117,14 +118,44 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
   });
 
   // ===== sessions =====
-
+  //
+  // POST /v1/sessions v3.0.1:
+  //   - In production mode (HEARTH_REQUIRE_DEV_TOKEN set): caller must
+  //     supply a matching x-hearth-dev-token header. role=admin requires
+  //     the additional x-hearth-admin token (or an OAuth callback in a
+  //     future revision).
+  //   - Without HEARTH_REQUIRE_DEV_TOKEN: dev-mode convenience only; never
+  //     enable this in production.
+  //   - role MUST be one of {admin, member, wall-tablet, service}.
+  //     The default is NO ROLE (rejected) rather than admin.
   type SessionCreateBody = { role?: ActorRole };
   app.post<{ Body: SessionCreateBody }>('/v1/sessions', async (req, reply) => {
-    const role = (req.body?.role ?? 'admin') as ActorRole;
-    if (!['admin', 'member', 'wall-tablet', 'service'].includes(role)) {
+    const role = (req.body?.role ?? null) as ActorRole | null;
+    if (!role || !['admin', 'member', 'wall-tablet', 'service'].includes(role)) {
       reply.code(400);
-      return { error: { code: 'invalid_role', message: `unknown role: ${role}` } };
+      return { error: { code: 'invalid_role', message: 'role required (admin | member | wall-tablet | service)' } };
     }
+
+    // Production gate.
+    const dev_token_required = process.env['HEARTH_REQUIRE_DEV_TOKEN'];
+    if (dev_token_required) {
+      const supplied = req.headers['x-hearth-dev-token'];
+      if (supplied !== dev_token_required) {
+        reply.code(403);
+        return { error: { code: 'auth_required', message: 'developer token required (x-hearth-dev-token)' } };
+      }
+    }
+
+    // role=admin in production mode requires an additional explicit grant
+    // unless HEARTH_ALLOW_DEV_ADMIN is set (CI / local-only).
+    if (role === 'admin' && !process.env['HEARTH_ALLOW_DEV_ADMIN']) {
+      const admin_grant = req.headers['x-hearth-admin-grant'];
+      if (admin_grant !== 'granted') {
+        reply.code(403);
+        return { error: { code: 'admin_grant_required', message: 'role=admin requires x-hearth-admin-grant: granted' } };
+      }
+    }
+
     const session = session_store.create(actorForRole(role, 'pending'));
     const signed = session_store.signCookie(session.session_id);
     setSessionCookie(reply, signed);
@@ -194,7 +225,25 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
         request_id,
         body.payload ?? {},
       );
-      return { request_id, decision, actor };
+
+      // v3.0.1: when the interpreter produces a ready_for_contract proposal,
+      // sign a receipt so /v1/contracts can verify the proposal was produced
+      // by this interpreter (this session) and not hand-built by the client.
+      const signing_key = opts.session_secret ?? 'hearth-dev-cookie-secret';
+      const decorated_decision = (() => {
+        if (decision.outcome === 'ready_for_contract' && decision.proposal) {
+          const receipt = issueReceipt(
+            { proposal: decision.proposal, request_id: request_id ?? randomUUID() },
+            signing_key,
+          );
+          return {
+            ...decision,
+            proposal_receipt: receipt.token,
+          };
+        }
+        return decision;
+      })();
+      return { request_id, decision: decorated_decision, actor };
     } catch (err) {
       if (err instanceof ForbiddenFieldError) {
         const mapped = mapDomainError(err);
@@ -209,6 +258,8 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
 
   type ContractCreateBody = {
     proposal: import('@hearth/contracts').IntentProposal;
+    /** opaque base64url token issued by /v1/interpret; v3.0.1 */
+    proposal_receipt?: string;
     request_id?: string;
     expiry_seconds?: number;
   };
@@ -231,6 +282,32 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
     const idempotency_key = request_id as IdempotencyKey;
     const actor: Actor = { ...session.actor, session_id: session.session_id };
 
+    // v3.0.1: verify the proposal was produced by /v1/interpret in this
+    // session. Hand-built proposals are rejected.
+    //
+    // Dev-mode convenience: when HEARTH_REQUIRE_DEV_TOKEN is unset (i.e.
+    // this is a development / test deployment), we accept un-receipted
+    // proposals to keep the bring-up loop simple. Production deployments
+    // MUST set HEARTH_REQUIRE_DEV_TOKEN (so the admin-grant gate is
+    // active) and proposals must carry a receipt.
+    if (process.env['HEARTH_REQUIRE_DEV_TOKEN'] && !body.proposal_receipt) {
+      reply.code(400);
+      return { error: { code: 'untrusted_proposal', message: 'proposal must be issued by /v1/interpret in production mode' } };
+    }
+    if (body.proposal_receipt) {
+      const receipt_token: string = body.proposal_receipt;
+      const verify = verifyReceipt(
+        receipt_token,
+        body.proposal,
+        request_id,
+        opts.session_secret ?? 'hearth-dev-cookie-secret',
+      );
+      if (!verify.ok) {
+        reply.code(400);
+        return { error: { code: 'untrusted_proposal', message: `proposal receipt: ${verify.reason}` } };
+      }
+    }
+
     try {
       const build_input: BuildContractInput = {
         actor,
@@ -244,6 +321,22 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
         },
         now: () => new Date(opts.clock.now()),
         expiry_seconds: body.expiry_seconds,
+        // v3.0.1: pass the live adapter through so the contract can capture
+        // the observed state_version + attributes at build time, and so
+        // relative desired_values are resolved to absolute values.
+        observed_state: async (canonical_id: string): Promise<number> => {
+          try {
+            const state = await opts.adapter.getState(canonical_id as never);
+            return state.state_version;
+          } catch {
+            return 0;
+          }
+        },
+        resolve_relative: async (
+          _target: string,
+          desired: Readonly<Record<string, number | string | boolean>>,
+          obs: Readonly<Record<string, unknown>>,
+        ) => resolveRelativeDesiredValues(desired, obs),
       };
       const { contract } = await buildContract(build_input);
       const receipt = await executor.dispatch(contract);

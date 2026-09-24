@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "doctor": "node dist/main.js doctor",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@fastify/cookie": "11.0.1",
@@ -23,6 +25,7 @@
     "@hearth/ha-adapter": "workspace:*",
     "@hearth/interpreter": "workspace:*",
     "@hearth/registry": "workspace:*",
+    "@hearth/scheduler": "workspace:*",
     "fastify": "5.1.0"
   },
   "devDependencies": {

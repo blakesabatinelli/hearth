@@ -67,7 +67,10 @@ const cloneDeviceRecord = (d: DeviceRecord): InternalDevice => ({
   ...d,
   state: {
     values: { ...initialValuesForDevice(d) },
-    state_version: 0,
+    // v3.0.1: start at 1 rather than 0 so that subsequent dispatches
+    // produce distinguishable state_versions (and the executor's
+    // stale-context check can detect a real change).
+    state_version: 1,
     observed_at: new Date(0).toISOString(),
   },
 });
