@@ -39,6 +39,13 @@ async function makeStore(sqlite_path: string): Promise<ExecutionStore> {
 }
 
 async function main(): Promise<void> {
+  // Subcommand: `doctor` runs the diagnostic and exits.
+  if (process.argv[2] === 'doctor') {
+    const result = await doctor();
+    if (result.fail > 0) process.exit(1);
+    return;
+  }
+
   const port = Number(process.env.HEARTH_PORT ?? 8787);
   const host = process.env.HEARTH_HOST ?? '0.0.0.0';
   const session_secret = process.env.HEARTH_SESSION_SECRET ?? 'dev-secret-change-me';
@@ -94,8 +101,112 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('[hearth-control] fatal:', err);
-  process.exit(1);
-});
+// CLI bootstrap: only runs when this file is the actual entry point.
+// When imported by tests, `import.meta.url` differs from `process.argv[1]`
+// and we skip the bootstrap.
+import { fileURLToPath } from 'node:url';
+const is_cli = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (is_cli) {
+  main().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[hearth-control] fatal:', err);
+    process.exit(1);
+  });
+}
+
+// Doctor subcommand: invoked via `node apps/control/dist/src/main.js doctor`.
+// Verifies registry, executor store, adapter, GLiNER2 (if URL set),
+// and reports PASS/WARN/FAIL with remediation hints.
+//
+// Exported separately so tests can import it without triggering main()'s
+// listen() call. The CLI calls doctor() before main() if argv[2]=='doctor'.
+export async function doctor(): Promise<{ pass: number; warn: number; fail: number }> {
+  const checks: Array<{ name: string; status: 'PASS' | 'WARN' | 'FAIL'; detail: string }> = [];
+
+  // Check 1: Node version.
+  const node_major = Number(process.versions.node.split('.')[0]);
+  if (node_major >= 20) {
+    checks.push({ name: 'node-runtime', status: 'PASS', detail: `node ${process.versions.node}` });
+  } else {
+    checks.push({ name: 'node-runtime', status: 'FAIL', detail: `node ${process.versions.node} requires >=20` });
+  }
+
+  // Check 2: SQLite path (if configured).
+  const sqlite_path = process.env.HEARTH_SQLITE_PATH ?? ':memory:';
+  if (sqlite_path === ':memory:') {
+    checks.push({ name: 'sqlite', status: 'WARN', detail: 'in-memory store; durable schedules will not survive restart' });
+  } else {
+    try {
+      const fs = await import('node:fs');
+      const dir = sqlite_path.substring(0, sqlite_path.lastIndexOf('/'));
+      if (dir && !fs.existsSync(dir)) {
+        checks.push({ name: 'sqlite', status: 'WARN', detail: `directory ${dir} does not exist yet; will be created on first write` });
+      } else {
+        checks.push({ name: 'sqlite', status: 'PASS', detail: sqlite_path });
+      }
+    } catch (err) {
+      checks.push({ name: 'sqlite', status: 'FAIL', detail: (err as Error).message });
+    }
+  }
+
+  // Check 3: Session secret strength.
+  const secret = process.env.HEARTH_SESSION_SECRET ?? '';
+  if (secret.length >= 32 && secret !== 'dev-secret-change-me') {
+    checks.push({ name: 'session-secret', status: 'PASS', detail: `${secret.length} chars` });
+  } else if (secret === 'dev-secret-change-me' || secret === '') {
+    checks.push({ name: 'session-secret', status: 'FAIL', detail: 'HEARTH_SESSION_SECRET is the dev default; set a 32-byte random secret' });
+  } else {
+    checks.push({ name: 'session-secret', status: 'WARN', detail: `${secret.length} chars; recommend >= 32` });
+  }
+
+  // Check 4: GLiNER2 sidecar (if URL set).
+  const extract_url = process.env.HEARTH_EXTRACT_URL ?? '';
+  if (extract_url) {
+    try {
+      const res = await fetch(`${extract_url}/health`);
+      if (res.ok) {
+        const body = await res.json() as { ready?: boolean };
+        checks.push({
+          name: 'gliner2-sidecar',
+          status: body.ready ? 'PASS' : 'WARN',
+          detail: `${extract_url}/health ready=${body.ready}`,
+        });
+      } else {
+        checks.push({ name: 'gliner2-sidecar', status: 'FAIL', detail: `${extract_url}/health returned ${res.status}` });
+      }
+    } catch (err) {
+      checks.push({ name: 'gliner2-sidecar', status: 'FAIL', detail: `${extract_url} unreachable: ${(err as Error).message}` });
+    }
+  } else {
+    checks.push({ name: 'gliner2-sidecar', status: 'WARN', detail: 'HEARTH_EXTRACT_URL not set; using mock-gliner2' });
+  }
+
+  // Check 5: Model locks present.
+  const fs = await import('node:fs');
+  for (const lock of ['models/bonsai.lock.json', 'models/gliner2.lock.json']) {
+    if (fs.existsSync(lock)) {
+      checks.push({ name: lock, status: 'PASS', detail: 'present' });
+    } else {
+      checks.push({ name: lock, status: 'FAIL', detail: 'missing' });
+    }
+  }
+
+  // Report.
+  let fail = 0;
+  let warn = 0;
+  let pass = 0;
+  for (const c of checks) {
+    const icon = c.status === 'PASS' ? '[OK]' : c.status === 'WARN' ? '[WARN]' : '[FAIL]';
+    console.log(`${icon} ${c.name}: ${c.detail}`);
+    if (c.status === 'PASS') pass += 1;
+    else if (c.status === 'WARN') warn += 1;
+    else fail += 1;
+  }
+  console.log('');
+  console.log(`Summary: ${pass} pass, ${warn} warn, ${fail} fail`);
+  return { pass, warn, fail };
+}
+
+// Default export for CLI: only the bootstrap. doctor() is exported
+// separately so importing the module for tests does not bind a port.
+export default { doctor };

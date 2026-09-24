@@ -1,0 +1,90 @@
+# docker-compose.yml - Hearth deployment.
+#
+# Three services on a private network:
+#   hearth-control: the HTTP API + scheduler
+#   hearth-web:     the PWA (built artifacts served by a static server)
+#   hearth-extract: the Python GLiNER2 sidecar (optional; control degrades
+#                   gracefully if it's not reachable)
+#
+# All persistent state lives in named volumes:
+#   hearth_db:     SQLite contracts + receipts + routines
+#   hearth_cfg:    config + session state
+#
+# Real deployments override:
+#   HEARTH_EXTRACT_URL:    URL of the extract sidecar
+#   HEARTH_SESSION_SECRET: must be 32+ random bytes in production
+#   HEARTH_SQLITE_PATH:    bind-mount path for the SQLite database
+
+networks:
+  hearth:
+    driver: bridge
+
+volumes:
+  hearth_db:
+  hearth_cfg:
+
+services:
+  hearth-extract:
+    image: hearth:local
+    build:
+      context: .
+      target: runtime
+    profiles: ["with-extract"]
+    command:
+      - sh
+      - -c
+      - "cd /app/apps/extract && .venv/bin/uvicorn hearth_extract:app --host 0.0.0.0 --port 8765 --no-access-log"
+    networks: [hearth]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  hearth-control:
+    image: hearth:local
+    build:
+      context: .
+      target: runtime
+    command: ["node", "apps/control/dist/src/main.js"]
+    environment:
+      HEARTH_PORT: "8787"
+      HEARTH_HOST: "0.0.0.0"
+      HEARTH_SQLITE_PATH: "/data/hearth.sqlite"
+      HEARTH_SESSION_SECRET: "${HEARTH_SESSION_SECRET:-dev-secret-change-me}"
+      HEARTH_EXTRACT_URL: "http://hearth-extract:8765"
+      NODE_ENV: "production"
+    ports:
+      - "8787:8787"
+    volumes:
+      - hearth_db:/data
+      - hearth_cfg:/config
+    networks: [hearth]
+    depends_on:
+      hearth-extract:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  hearth-web:
+    image: hearth:local
+    build:
+      context: .
+      target: runtime
+    command: ["npx", "--yes", "serve", "-s", "apps/web/dist", "-l", "5173"]
+    environment:
+      NODE_ENV: "production"
+    ports:
+      - "5173:5173"
+    networks: [hearth]
+    depends_on:
+      - hearth-control
+    restart: unless-stopped
