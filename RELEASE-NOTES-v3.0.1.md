@@ -55,9 +55,15 @@ apps/web:               23/23
 
 Still requires the deployment machine for live OpenClaw, Bonsai 27B,
 GLiNER2 `fastino/gliner2.5-base-v1`, Home Assistant credentials, and a
-labeled evaluation corpus. Stage 8 of
-`HEARTH_HERMES_DEVELOPMENT_PLAN.md` still gates a production-ready
-declaration.
+labeled evaluation corpus. A production-ready declaration is gated on a
+live-resource end-to-end run; this release is fixture-mode only.
+
+## Documentation status
+
+This tag predates the `agent | docs | scrub personal references` commit
+on `main` (`84e246f`). All publication-facing docs on `main` are now
+clean of personal references; clone URLs use the `<owner>/hearth`
+placeholder. The release artifact itself is unchanged otherwise.
 
 ## Upgrade from v3.0
 
