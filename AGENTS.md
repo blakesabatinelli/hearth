@@ -4,14 +4,14 @@
 
 ## What Hearth is
 
-Hearth is Blake's installable home management system: a PWA front end (Rooms, Favorites, Ask, Routines, Attention), an independent TypeScript control service (`hearth-control`), a pinned OpenClaw conversational runtime (`hearth-openclaw`), and a local Bonsai language model (`hearth-bonsai`). Home Assistant is the principal integration layer. SmartThings/Hue pairings are preserved.
+Hearth is Blake's installable home management system: a PWA front end (Rooms, Favorites, Ask, Routines, Attention), an independent TypeScript control service (`hearth-control`), a pinned OpenClaw conversational runtime (`hearth-openclaw`), a separate Python extractor sidecar (`hearth-extract`, running GLiNER2 v2.0.0), and a local Bonsai language model (`hearth-bonsai`). Home Assistant is the principal integration layer. SmartThings/Hue pairings are preserved.
 
-The whole plan is in `HEARTH_HERMES_DEVELOPMENT_PLAN.md` (v3.0, 2026-09-24). Read it before changing scope. This file is the working contract; the plan is the spec.
+The whole plan is in `HEARTH_HERMES_DEVELOPMENT_PLAN.md` (v3.0, 2026-09-24). Read it before changing scope. This file is the working contract; the plan is the spec. Note: per `docs/decisions/ADR-2026-09-24-gliner2-required.md`, GLiNER2 is required (not optional), as the first model invoked for natural-language requests, ahead of Bonsai fallback. The plan's "optional measured experiment" wording is superseded.
 
 ## Hard rules (no exceptions)
 
 1. **No em dashes anywhere.** Use regular `-` or rewrite. Vault rule.
-2. **Bonsai is the only model.** No Qwen, no cloud fallback. Model is gated behind the `BonsaiProvider` interface. The `mock-bonsai` adapter stands in until real weights + serving runtime round-trip (user-approved 2026-09-24).
+2. **Bonsai is one of two reasoning models.** No Qwen, no cloud fallback. Model is gated behind the `BonsaiProvider` interface. The `mock-bonsai` adapter stands in until real weights + serving runtime round-trip (user-approved 2026-09-24). **GLiNER2 is the first model invoked for natural-language requests** (after the deterministic grammar parser). It runs in a separate Python sidecar (`hearth-extract`); see `docs/decisions/ADR-2026-09-24-gliner2-required.md`. Authority separation: GLiNER2 proposes meaning; the resolver owns actor/permission/scope/evidence.
 3. **No device actuation outside the executor.** UI, routines, direct controls, model output -  all reach physical devices through the executor's contract path. Opaque scripts and scenes do not bypass checks via name-only allowlist.
 4. **No `actor_id`/`role`/`policy` from the model or the client.** Server-side only.
 5. **Existing SmartThings/Hue pairings are preserved.** No re-pairing. No migration. Paid SmartThings is acceptable.

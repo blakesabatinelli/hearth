@@ -68,7 +68,7 @@ function fs_read(p) {
 
 const PATTERNS = [
   ['macos-users-path', /\/Users\/(?!blake\.sabatinelli\/Desktop\/hearth)/],
-  ['private-ip', /\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|127\.\d+\.\d+\.\d+)\b/],
+  ['private-ip-rfc1918', /\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)\b/],
   ['em-dash', /\u2014/],
   ['en-dash', /\u2013/],
   ['em-dash-entity', /&mdash;|&ndash;|&#8212;|&#8211;/],

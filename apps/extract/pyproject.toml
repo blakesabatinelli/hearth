@@ -1,0 +1,37 @@
+[project]
+name = "hearth-extract"
+version = "0.0.1"
+description = "GLiNER2 inference sidecar for Hearth. Separate Python process; called by hearth-control over local HTTP/Unix socket."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "gliner2[local]>=2.0.0,<3.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+hearth-extract = "hearth_extract.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hearth_extract*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+# Source: ADR-2026-09-24-gliner2-required.
+# Pin:    models/gliner2.lock.json

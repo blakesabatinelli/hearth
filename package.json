@@ -2,7 +2,7 @@
   "name": "hearth",
   "version": "0.0.1",
   "private": true,
-  "description": "Hearth - installable home management system built on OpenClaw + Bonsai 27B",
+  "description": "Hearth - installable home management system built on OpenClaw + Bonsai 27B + GLiNER2",
   "type": "module",
   "engines": {
     "node": ">=20.11.0",
@@ -16,7 +16,7 @@
     "test:unit": "pnpm -r --filter='./packages/*' --filter='./apps/*' --if-present run test:unit",
     "test:integration": "pnpm -r --filter='./packages/ha-adapter' --filter='./apps/control' --if-present run test:integration",
     "doctor": "node packages/cli/dist/cli.js doctor",
-    "verify:lock": "node scripts/verify-bonsai-lock.mjs",
+    "verify:lock": "node scripts/verify-bonsai-lock.mjs && node scripts/verify-gliner2-lock.mjs",
     "verify:portability": "node scripts/verify-portability.mjs"
   },
   "devDependencies": {

@@ -104,9 +104,10 @@ export type Room = {
 // =============================================================================
 
 /**
- * A structured proposal produced by either the grammar parser or Bonsai.
- * This is the *only* shape the model is allowed to emit. Server-side
- * validation runs again, then the resolver turns this into a Contract.
+ * A structured proposal produced by either the GLiNER2 extraction path,
+ * the deterministic grammar parser, or Bonsai fallback. This is the *only*
+ * shape those layers are allowed to emit. Server-side validation runs
+ * again, then the resolver turns this into a Contract.
  *
  * Plan section 7: model output is untrusted input to the resolver, even
  * when syntactically valid. Malformed/unsupported output causes
@@ -115,6 +116,10 @@ export type Room = {
  * NOTE: there is no `actor_id`/`role`/`policy`/`expiry`/`allowed_devices`
  * field here. Those are server-derived. The proposal binds to the active
  * request record via `request_id`.
+ *
+ * The `provenance` field records which layer emitted the proposal. The
+ * executor uses this for routing and metrics; it does NOT grant any
+ * authority (plan section 7 + ADR-2026-09-24-gliner2-required).
  */
 export type IntentProposal = {
   readonly request_id: string;          // opaque server-side request record id
@@ -125,7 +130,14 @@ export type IntentProposal = {
   readonly temporal: TemporalClause | null;
   readonly unresolved_fields: ReadonlyArray<string>;
   readonly confidence: number;          // 0..1, advisory only, server may override
+  readonly provenance: ProposalProvenance;
 };
+
+export type ProposalProvenance =
+  | { readonly source: 'grammar'; readonly matched_rule: string }
+  | { readonly source: 'gliner2'; readonly checkpoint_id: string; readonly schema_version: string }
+  | { readonly source: 'bonsai'; readonly adapter_id: string }
+  | { readonly source: 'composed-gliner2-bonsai'; readonly gliner2_checkpoint_id: string; readonly bonsai_adapter_id: string };
 
 export type IntentFamily =
   | 'set-state'
@@ -320,6 +332,115 @@ export interface BonsaiProvider {
   validateProposal(raw: unknown): IntentProposal;
 }
 
+/**
+ * GLiNER2 extraction provider. ADR-2026-09-24-gliner2-required: GLiNER2
+ * is the FIRST model used for natural-language requests, not Bonsai. The
+ * grammar parser runs first (cheapest); if it cannot produce a complete,
+ * validated interpretation, GLiNER2 runs; only if that fails AND the
+ * request clearly requires contextual reasoning does Bonsai get called.
+ *
+ * The provider is untrusted input on output. The resolver still owns
+ * authority: identity, permissions, target scope, evidence.
+ *
+ * Implementation note: GLiNER2 is a Python library (Apache-2.0,
+ * fastino-ai/GLiNER2). The provider here is an HTTP/socket client; the
+ * actual model runs in a separate `hearth-extract` Python sidecar. This
+ * keeps each layer's runtime separate per plan section 4 ("the boxes
+ * for parser, executor and scheduler are modules of the independent
+ * control service" - GLiNER2 is explicitly outside that).
+ */
+export interface ExtractionProvider {
+  /**
+   * Extract entities, classifications, structured records, relations, and
+   * span attributes from a natural-language utterance given a schema.
+   * The schema is derived from the registered devices, scenes, and
+   * command categories.
+   *
+   * Returns a structured ExtractionResult. The provider MUST reject
+   * inputs that cannot be made safe (silently dropping a clause is not
+   * allowed; the resolver must see "unresolved").
+   */
+  extract(req: { request_id: string; utterance: string; schema: ExtractionSchema }): Promise<ExtractionResult>;
+
+  /**
+   * Health check. Returns true only if the model is loaded and ready
+   * to serve. Used by hearth-control's doctor and by the routing layer
+   * to decide whether the GLiNER2 path is available.
+   */
+  health(): Promise<{ ready: boolean; checkpoint_id: string; latency_ms_p50: number | null }>;
+}
+
+/**
+ * Schema passed to GLiNER2. Built from the registry + active command
+ * categories. GLiNER2 is schema-driven: passing a tight schema is what
+ * makes the extraction fast and accurate.
+ */
+export type ExtractionSchema = {
+  readonly schema_version: string;
+  readonly entity_types: ReadonlyArray<ExtractionEntityType>;
+  readonly classification_labels: ReadonlyArray<ExtractionLabel>;
+  readonly relations: ReadonlyArray<ExtractionRelation>;
+  readonly known_aliases: ReadonlyArray<{ canonical_id: CanonicalId; aliases: ReadonlyArray<string> }>;
+};
+
+export type ExtractionEntityType =
+  | 'device_target'
+  | 'room'
+  | 'group'
+  | 'exclusion'
+  | 'time_expression'
+  | 'value_expression';
+
+export type ExtractionLabel =
+  | 'on'
+  | 'off'
+  | 'set_brightness'
+  | 'dim_by'
+  | 'set_scene'
+  | 'hold_until'
+  | 'routine_trigger'
+  | 'query_state';
+
+export type ExtractionRelation =
+  | { readonly kind: 'target_of'; readonly from: ExtractionEntityType; readonly to: ExtractionEntityType }
+  | { readonly kind: 'modifies'; readonly from: ExtractionLabel; readonly to: 'value_expression' | 'time_expression' };
+
+export type ExtractionResult = {
+  readonly request_id: string;
+  readonly entities: Readonly<Record<string, ReadonlyArray<string>>>;
+  readonly classifications: ReadonlyArray<{ readonly label: ExtractionLabel; readonly span: string }>;
+  readonly relations: ReadonlyArray<{ readonly kind: string; readonly head: string; readonly tail: string }>;
+  readonly unresolved: ReadonlyArray<string>;
+  readonly confidence: number;
+  /**
+   * The original utterance, preserved verbatim. Pass-through required by
+   * ADR-2026-09-24-gliner2-required point 3: when the extraction path is
+   * incomplete, the full utterance (NOT just extracted fields) is passed to
+   * Bonsai so context is not silently dropped.
+   */
+  readonly original_utterance: string;
+};
+
+/**
+ * Routing decision made by the interpreter after running grammar +
+ * GLiNER2 (and possibly Bonsai). One of five outcomes.
+ *
+ * - ready_for_contract:        all required fields resolved; pass to executor
+ * - needs_gliner2:             grammar failed; call GLiNER2 next
+ * - needs_bonsai:              GLiNER2 incomplete AND contextual reasoning needed
+ * - needs_clarification:       multi-interpretation or missing required field
+ * - unsupported:               command category not in the supported set
+ *
+ * ADR-2026-09-24-gliner2-required point 4: when genuinely ambiguous,
+ * ask the user, do NOT ask another model to guess.
+ */
+export type RoutingDecision =
+  | { readonly outcome: 'ready_for_contract'; readonly proposal: IntentProposal }
+  | { readonly outcome: 'needs_gliner2'; readonly reason: string; readonly utterance: string }
+  | { readonly outcome: 'needs_bonsai'; readonly reason: string; readonly utterance: string; readonly gliner2_partial: ExtractionResult | null }
+  | { readonly outcome: 'needs_clarification'; readonly reason: string; readonly candidates: ReadonlyArray<IntentProposal> }
+  | { readonly outcome: 'unsupported'; readonly reason: string };
+
 export type ProposalContext = {
   readonly known_devices: ReadonlyArray<{ canonical_id: CanonicalId; friendly_name: string; aliases: ReadonlyArray<string>; room_name: string | null }>;
   readonly known_scenes: ReadonlyArray<{ scene_id: string; friendly_name: string; scope_version: number }>;
@@ -342,3 +463,4 @@ export type IdempotencyKey = string & { readonly __brand: 'IdempotencyKey' };
 
 export const HEARTH_SCHEMA_VERSION = '0.0.1';
 export const HEARTH_OPENCLAW_PIN = '2026.9.6';
+export const HEARTH_GLINER2_PIN = '2.0.0';

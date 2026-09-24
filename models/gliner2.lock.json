@@ -1,0 +1,59 @@
+{
+  "$schema": "./gliner2.lock.schema.json",
+  "lock_version": 1,
+  "generated_at": "2026-09-24",
+  "generated_by": "hermes hand-off",
+  "extractor": {
+    "family": "gliner2",
+    "pypi_package": "gliner2",
+    "status": "pinned",
+    "version": "2.0.0",
+    "primary_source": {
+      "kind": "github",
+      "url": "https://github.com/fastino-ai/GLiNER2",
+      "tag": "v2.0.0",
+      "commit_sha": "3c913c7369301133d3b7699252074c4303ada50e",
+      "license": "Apache-2.0"
+    },
+    "pypi": {
+      "name": "gliner2",
+      "version": "2.0.0",
+      "sha256": null,
+      "release_url": "https://pypi.org/project/gliner2/2.0.0/"
+    },
+    "runtime": {
+      "language": "python",
+      "min_version": "3.10",
+      "extras_required": "gliner2[local]",
+      "sidecar_service": "hearth-extract"
+    },
+    "default_checkpoint": {
+      "hub_id": "fastino/gliner2.5-base-v1",
+      "architecture": "boundary",
+      "supports_long_utterances": true,
+      "license": "Apache-2.0 (per upstream)"
+    },
+    "alternate_checkpoints": [
+      { "hub_id": "fastino/gliner2-base-v1", "architecture": "span", "note": "legacy span extractor" }
+    ],
+    "evaluation": {
+      "minimum_cases": 200,
+      "labeled_set_path": "eval/commands/",
+      "metric_targets": {
+        "exact_supported_unambiguous_min": 0.95,
+        "wrong_target_rate_max": 0.0,
+        "dropped_exclusion_rate_max": 0.0,
+        "abstention_on_unsupported": "report separately, must be high",
+        "bonsai_invocation_rate_max": 0.30
+      }
+    }
+  },
+  "notes": [
+    "ADR-2026-09-24-gliner2-required: GLiNER2 is the FIRST model invoked for natural-language requests (after the deterministic grammar parser). Bonsai is fallback only when GLiNER2 path is incomplete AND the request clearly requires contextual reasoning.",
+    "Implementation: Python sidecar `hearth-extract`. The hearth-control service calls it over a local HTTP/Unix socket. The sidecar ships with the installer (plan section 11) and has its own pinning lock.",
+    "Authority separation: GLiNER2 proposes meaning. The resolver (in hearth-control) owns actor identity, permissions, target scope, evidence. Same constraint as Bonsai (plan section 7).",
+    "Failure isolation: if GLiNER2 is unavailable, direct controls + saved routines still work; only the natural-language Ask surface degrades. Same as Bonsai unavailability.",
+    "No cloud inference. The Apache-2.0 licensed checkpoint downloads at install time; no telemetry; no remote calls. CPU-first per upstream README.",
+    "When upgrading this lock, re-run Stage 0/3 gate (eval suite must hold the metric_targets above)."
+  ]
+}

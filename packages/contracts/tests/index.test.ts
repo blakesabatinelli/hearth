@@ -2,15 +2,19 @@ import { describe, it, expect } from 'vitest';
 import {
   HEARTH_SCHEMA_VERSION,
   HEARTH_OPENCLAW_PIN,
+  HEARTH_GLINER2_PIN,
   type IntentProposal,
   type Contract,
   type DeviceRecord,
+  type ExtractionResult,
+  type RoutingDecision,
 } from '../src/index.js';
 
 describe('contracts package', () => {
   it('exports a frozen schema version', () => {
     expect(HEARTH_SCHEMA_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
     expect(HEARTH_OPENCLAW_PIN).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(HEARTH_GLINER2_PIN).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it('IntentProposal carries NO actor_id/role/policy fields', () => {
@@ -24,6 +28,7 @@ describe('contracts package', () => {
       temporal: null,
       unresolved_fields: [],
       confidence: 0.9,
+      provenance: { source: 'grammar', matched_rule: 'set-brightness-absolute@1' },
     };
     const keys = Object.keys(fake);
     expect(keys).not.toContain('actor_id');
@@ -33,6 +38,57 @@ describe('contracts package', () => {
     expect(keys).not.toContain('policy');
     expect(keys).not.toContain('expiry_at');
     expect(keys).not.toContain('retry_limit');
+  });
+
+  it('IntentProposal provenance discriminants', () => {
+    const grammarProposal: IntentProposal = {
+      request_id: 'r1', intent_family: 'set-state',
+      target_phrases: ['kitchen'], exclusions: [], desired_values: { on: true },
+      temporal: null, unresolved_fields: [], confidence: 1,
+      provenance: { source: 'grammar', matched_rule: 'turn-on@1' },
+    };
+    const glinerProposal: IntentProposal = {
+      request_id: 'r2', intent_family: 'set-brightness-absolute',
+      target_phrases: ['living room'], exclusions: [], desired_values: { brightness: 60 },
+      temporal: null, unresolved_fields: [], confidence: 0.92,
+      provenance: { source: 'gliner2', checkpoint_id: 'fastino/gliner2.5-base-v1', schema_version: '1' },
+    };
+    const bonsaiProposal: IntentProposal = {
+      request_id: 'r3', intent_family: 'set-state',
+      target_phrases: ['mood lighting'], exclusions: ['office'], desired_values: { on: true },
+      temporal: null, unresolved_fields: [], confidence: 0.7,
+      provenance: { source: 'bonsai', adapter_id: 'openclaw-gateway/2026.9.6' },
+    };
+    expect(grammarProposal.provenance.source).toBe('grammar');
+    expect(glinerProposal.provenance.source).toBe('gliner2');
+    expect(bonsaiProposal.provenance.source).toBe('bonsai');
+  });
+
+  it('ExtractionResult preserves original_utterance (ADR point 3)', () => {
+    // Compiler-enforced by the type. Just verify shape.
+    const e: ExtractionResult = {
+      request_id: 'r1',
+      entities: { device_target: ['living room lamp'] },
+      classifications: [{ label: 'set_brightness', span: 'dim it' }],
+      relations: [],
+      unresolved: [],
+      confidence: 0.85,
+      original_utterance: 'dim it a bit',
+    };
+    expect(e.original_utterance).toBe('dim it a bit');
+    expect(Object.keys(e).sort()).toContain('original_utterance');
+  });
+
+  it('RoutingDecision five variants are distinct', () => {
+    const decisions: RoutingDecision[] = [
+      { outcome: 'ready_for_contract', proposal: {} as IntentProposal },
+      { outcome: 'needs_gliner2', reason: 'unsupported conjunction', utterance: 'turn on x and y' },
+      { outcome: 'needs_bonsai', reason: 'context-dependent', utterance: 'set the mood', gliner2_partial: null },
+      { outcome: 'needs_clarification', reason: 'two candidates', candidates: [] },
+      { outcome: 'unsupported', reason: 'category not supported' },
+    ];
+    const kinds = new Set(decisions.map((d) => d.outcome));
+    expect(kinds.size).toBe(5);
   });
 
   it('Contract contains server-derived actor and policy fields', () => {
