@@ -34,6 +34,8 @@ describe('AC-12 service boots', () => {
 
 describe('AC-14 session + CSRF', () => {
   it('POST /v1/sessions creates a session, sets a cookie, returns csrf_token', async () => {
+    // AC-14 test: with the v3.0.1 admin-grant gate, dev/CI must explicitly opt in.
+    process.env['HEARTH_ALLOW_DEV_ADMIN'] = '1';
     const res = await tc.app.inject({
       method: 'POST',
       url: '/v1/sessions',

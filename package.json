@@ -15,9 +15,12 @@
     "test": "pnpm -r --filter='./packages/*' --filter='./apps/*' test",
     "test:unit": "pnpm -r --filter='./packages/*' --filter='./apps/*' --if-present run test:unit",
     "test:integration": "pnpm -r --filter='./packages/ha-adapter' --filter='./apps/control' --if-present run test:integration",
+    "integration": "pnpm -r --filter='./packages/ha-adapter' --filter='./apps/control' --if-present run test:integration",
     "doctor": "node packages/cli/dist/cli.js doctor",
     "verify:lock": "node scripts/verify-bonsai-lock.mjs && node scripts/verify-gliner2-lock.mjs",
-    "verify:portability": "node scripts/verify-portability.mjs"
+    "verify:portability": "node scripts/verify-portability.mjs",
+    "start": "node apps/control/dist/src/main.js",
+    "upgrade": "node scripts/upgrade.mjs"
   },
   "devDependencies": {
     "typescript": "5.6.3",

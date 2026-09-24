@@ -240,6 +240,13 @@ export type SchedulerOptions = {
   readonly executor_registry: ExecutorRegistryOverlay;
   readonly clock: Clock;
   readonly tick_seconds?: number;
+  /**
+   * v3.0.1: optional state-version lookup. When provided the scheduler
+   * records the live observed state_version on each contract target so the
+   * executor's stale-context check at dispatch time has a real comparison.
+   * When absent the scheduler falls back to 1 (the executor still re-checks).
+   */
+  readonly state_lookup?: (canonical_id: string) => Promise<number>;
 };
 
 export class Scheduler {
@@ -249,6 +256,7 @@ export class Scheduler {
   private readonly executor_registry: ExecutorRegistryOverlay;
   private readonly clock: Clock;
   private readonly tick_ms: number;
+  private state_lookup: ((canonical_id: string) => Promise<number>) | null = null;
   private interval: NodeJS.Timeout | null = null;
   private running = false;
 
@@ -259,6 +267,7 @@ export class Scheduler {
     this.executor_registry = opts.executor_registry;
     this.clock = opts.clock;
     this.tick_ms = (opts.tick_seconds ?? 30) * 1000;
+    this.state_lookup = opts.state_lookup ?? null;
   }
 
   public start(): void {
@@ -390,7 +399,11 @@ export class Scheduler {
     const proposal: IntentProposal = {
       request_id,
       intent_family: 'set-state',
-      target_phrases: [],
+      // v3.0.1: hold's held canonical_id flows into target_phrases here so
+      // the scheduler's own buildContract() resolves it back to a real
+      // target. This produces a non-empty Contract whose actor is the
+      // hold's creator and whose desired_values are the restore-to set.
+      target_phrases: [h.target_canonical_id as string],
       exclusions: [],
       desired_values: desired,
       temporal: null,
@@ -407,7 +420,7 @@ export class Scheduler {
         role: 'service',
         session_id: 'scheduler',
       },
-      target_phrases: [],
+      target_phrases: [h.target_canonical_id as string],
       desired_values: desired,
       exclusions: [],
       intent_family: 'set-state',
@@ -431,11 +444,26 @@ export class Scheduler {
       for (const m of matches) {
         const dev = this.executor_registry.getDevice(m.device.canonical_id);
         if (!dev) continue;
+        // v3.0.1: capture the device's state_version at dispatch-build time
+        // rather than the v3.0 placeholder of 0. When an adapter handle is
+        // available, query it; otherwise fall back to 1 so the value
+        // distinguishes "captured" from "zero-silenced", and rely on the
+        // executor's stale-context re-check at execute time.
+        let state_version = 1;
+        const lookup = this.state_lookup;
+        if (lookup) {
+          try {
+            const observed = await lookup(dev.canonical_id);
+            if (typeof observed === 'number') state_version = observed;
+          } catch {
+            // leave at 1
+          }
+        }
         targets.push({
           canonical_id: dev.canonical_id,
           load_type: dev.load_type as LoadType,
           route: dev.route_preference as RoutePreference,
-          state_version: 0,
+          state_version,
         });
       }
     }
