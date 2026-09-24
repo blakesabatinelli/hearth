@@ -4,15 +4,15 @@
 |---|---|
 | Date | 2026-09-24 |
 | Status | ACCEPTED |
-| Deciders | Blake Sabatinelli (correction directive), Hermes (proposer + implementer) |
-| Related | HEARTH_HERMES_DEVELOPMENT_PLAN.md v3.0 §3 (Deferred list said "GLiNER2 remains an optional measured experiment after the baseline works") and §17 source [7] |
+| Deciders | The project owner (correction directive), Hermes (proposer + implementer) |
+| Related | The development plan §3 (deferred list said "GLiNER2 remains an optional measured experiment after the baseline works") and §17 source [7] |
 | Supersedes | The above passage of the plan |
 
 ## Context
 
-The development plan v3.0 demoted GLiNER2 to "an optional measured experiment after the baseline works." That was a planning error on my part: the original Blueprint (HEARTH_BUILD_PLAN_2.md v2.1) treated GLiNER2 as the primary extraction layer, with Bonsai as the reasoning fallback for things GLiNER2 could not resolve. The plan review correctly flagged GLiNER2 limits and asked for measured evaluation, but in re-stating scope, it demoted GLiNER2 entirely. That was wrong on inspection: GLiNER2 is *schema-driven and CPU-first*, which is the opposite of Bonsai's profile. Demoting it forces every natural-language request through an LLM, which is more expensive, slower, and harder to constrain than the schema-driven path GLiNER2 was designed for.
+The development plan v3.0 demoted GLiNER2 to "an optional measured experiment after the baseline works." That was a planning error on the proposer's part: the original Blueprint (v2.1) treated GLiNER2 as the primary extraction layer, with Bonsai as the reasoning fallback for things GLiNER2 could not resolve. The plan review correctly flagged GLiNER2 limits and asked for measured evaluation, but in re-stating scope, it demoted GLiNER2 entirely. That was wrong on inspection: GLiNER2 is *schema-driven and CPU-first*, which is the opposite of Bonsai's profile. Demoting it forces every natural-language request through an LLM, which is more expensive, slower, and harder to constrain than the schema-driven path GLiNER2 was designed for.
 
-Blake has now directed: GLiNER2 is a required part of the interpretation and decision-routing layer. The plan's demoted-language passages are superseded.
+The project owner has directed: GLiNER2 is a required part of the interpretation and decision-routing layer. The plan's demoted-language passages are superseded.
 
 ## Decision
 
@@ -51,7 +51,7 @@ Concretely:
 - + Routing decisions are explicit; the user can see why something routed where.
 - - One more moving part (the Python sidecar) and one more dependency install path.
 - - Eval suite gets bigger.
-- - Author must verify that GLiNER2 path meets the gate; if it doesn't, that category is gated to Bonsai/clarification rather than silently removed (per Blake's directive).
+- - Author must verify that GLiNER2 path meets the gate; if it doesn't, that category is gated to Bonsai/clarification rather than silently removed (per the project owner's directive).
 
 ## Verification
 

@@ -40,7 +40,7 @@ HEARTH_GLINER2_MODEL_ID=fastino/gliner2.5-base-v1   # pinned in models/gliner2.l
 
 ```bash
 # As root, on a fresh Debian 12 box:
-curl -fsSL https://raw.githubusercontent.com/blakesabatinelli/hearth/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/hearth/main/scripts/install.sh | bash
 ```
 
 The installer will:

@@ -4,9 +4,9 @@
 
 ## What Hearth is
 
-Hearth is Blake's installable home management system: a PWA front end (Rooms, Favorites, Ask, Routines, Attention), an independent TypeScript control service (`hearth-control`), a pinned OpenClaw conversational runtime (`hearth-openclaw`), a separate Python extractor sidecar (`hearth-extract`, running GLiNER2 v2.0.0), and a local Bonsai language model (`hearth-bonsai`). Home Assistant is the principal integration layer. SmartThings/Hue pairings are preserved.
+Hearth is an installable home management system: a PWA front end (Rooms, Favorites, Ask, Routines, Attention), an independent TypeScript control service (`hearth-control`), a pinned OpenClaw conversational runtime (`hearth-openclaw`), a separate Python extractor sidecar (`hearth-extract`, running GLiNER2 v2.0.0), and a local Bonsai language model (`hearth-bonsai`). Home Assistant is the principal integration layer. SmartThings/Hue pairings are preserved.
 
-The whole plan is in `HEARTH_HERMES_DEVELOPMENT_PLAN.md` (v3.0, 2026-09-24). Read it before changing scope. This file is the working contract; the plan is the spec. Note: per `docs/decisions/ADR-2026-09-24-gliner2-required.md`, GLiNER2 is required (not optional), as the first model invoked for natural-language requests, ahead of Bonsai fallback. The plan's "optional measured experiment" wording is superseded.
+Note: per `docs/decisions/ADR-2026-09-24-gliner2-required.md`, GLiNER2 is required (not optional), as the first model invoked for natural-language requests, ahead of Bonsai fallback.
 
 ## Hard rules (no exceptions)
 

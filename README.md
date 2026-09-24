@@ -8,6 +8,30 @@ An installable home management system. PWA front end + independent TypeScript co
 
 **How to work this repo:** read `AGENTS.md` first.
 
+## Install and run on macOS
+
+The complete Apple Silicon host setup is in [`docs/macos-host-setup.md`](docs/macos-host-setup.md). It gives command-by-command instructions to:
+
+- Clone the public `main` branch.
+- Install, build, test, and start the current Hearth source.
+- Download and serve the pinned Bonsai 27B GGUF.
+- Install and configure the pinned OpenClaw runtime.
+- Install and run the GLiNER2 sidecar.
+- Install or connect Home Assistant without re-pairing existing devices.
+- Verify each process and identify the integration work that remains before live actuation.
+
+Start with:
+
+```bash
+mkdir -p "$HOME/src"
+cd "$HOME/src"
+git clone --branch main --single-branch https://github.com/<owner>/hearth.git
+cd hearth
+sed -n '1,240p' docs/macos-host-setup.md
+```
+
+This repository is still at Stage 0. The checked-in application runs in fixture mode, and the setup guide does not claim that the current revision provides a complete live-device integration.
+
 ## Architecture
 
 ```
@@ -56,7 +80,7 @@ packages/cli/         install / configure / doctor / backup / upgrade / rollback
 
 ## Bonsai + GLiNER2 model locks
 
-`models/bonsai.lock.json` pins the Bonsai 27B reasoning model. Real weights are deferred per Decision 1 (2026-09-24); the `mock-bonsai` adapter stands in until Blake provides a serving-runtable Bonsai.
+`models/bonsai.lock.json` pins the Bonsai 27B reasoning model. Real weights are deferred to the deployment machine; the `mock-bonsai` adapter stands in until they are available.
 
 `models/gliner2.lock.json` pins the GLiNER2 extractor (v2.0.0, Apache-2.0). GLiNER2 is the first model used for natural-language requests (ADR-2026-09-24-gliner2-required). It runs in a separate `hearth-extract` Python sidecar; hearth-control calls over a local socket.
 
