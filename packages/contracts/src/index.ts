@@ -308,7 +308,13 @@ export type StateObservation = {
 
 export type DispatchAck =
   | { readonly kind: 'sent'; readonly provider: string; readonly echoed_at: string }
-  | { readonly kind: 'rejected'; readonly reason: string };
+  | { readonly kind: 'rejected'; readonly reason: string }
+  // No-op fast path: the desired state already matches current state,
+  // so the adapter did NOT send anything. The receipt can record
+  // `already-satisfied` immediately. Required by plan section 8: the
+  // executor needs the signal to distinguish "no work was done because
+  // state already matched" from "command was sent, observation pending."
+  | { readonly kind: 'no-op'; readonly observed_at: string; readonly state_version: number };
 
 export type StateHandler = (obs: StateObservation) => void;
 export type UnsubscribeableSubscription = { unsubscribe(): void };
