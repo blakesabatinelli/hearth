@@ -643,18 +643,18 @@ export HEARTH_EXTRACT_URL=http://127.0.0.1:8770
 echo "Wrote session secret to $HEARTH_SECRET_DIR/hearth-session-secret (600)"
 ```
 
-Open another Terminal window and start the control API:
+Open another Terminal window and start the control API. If you
+persisted the HEARTH_*_DIR lines to ~/.zshenv, the directory exports
+below are redundant; they are written here for clarity when running
+the API in a fresh shell.
 
 ```bash
 export HEARTH_REPO="$HOME/src/hearth"
 cd "$HEARTH_REPO"
-# If you persisted the HEARTH_*_DIR lines to ~/.zshenv, these next
-# three exports are redundant; they are written here for clarity
-# when running the API in a fresh shell.
 export HEARTH_RUNTIME_ROOT="$HOME/Library/Application Support/Hearth"
 export HEARTH_DATA_DIR="$HEARTH_RUNTIME_ROOT/data"
 export HEARTH_SECRET_DIR="$HEARTH_RUNTIME_ROOT/secrets"
-: "${HEARTH_SESSION_SECRET:?must be set - run section 12's secret-creation block in this shell}"
+export HEARTH_SESSION_SECRET="$(< "$HEARTH_SECRET_DIR/hearth-session-secret")"
 export HEARTH_SQLITE_PATH="$HEARTH_DATA_DIR/hearth.sqlite"
 export HEARTH_HOST=127.0.0.1
 export HEARTH_PORT=8787
