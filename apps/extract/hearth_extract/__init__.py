@@ -107,12 +107,17 @@ async def extract(req: ExtractRequest) -> dict:
     # by design: pass only the entity types and labels relevant to this
     # request (built hearth-side from registry + active categories).
     # gliner2 v2.0.0's `extract(text, schema, threshold)` accepts a
-    # dict with keys {"entities", "classifications", "relations"} —
-    # passing entity_types= and labels= as kwargs is the v1 API and
+    # dict with keys {"entities", "classifications", "relations"}:
+    #   entities       = list[str] (normalized internally)
+    #   classifications = list[dict] (each dict must have "task" key)
+    #   relations       = list[dict]
+    # Passing entity_types= and labels= as kwargs is the v1 API and
     # raises TypeError against the pinned v2.0.0 release.
     schema = {
         "entities": req.schema_in.entity_types,
-        "classifications": req.schema_in.classification_labels,
+        "classifications": [
+            {"task": label, "labels": [label]} for label in req.schema_in.classification_labels
+        ],
         "relations": req.schema_in.relations,
     }
     try:
