@@ -1,0 +1,26 @@
+{
+  "name": "@hearth/openclaw-adapter",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3",
+    "@types/node": "22.10.5",
+    "vitest": "2.1.9",
+    "@hearth/contracts": "workspace:*"
+  }
+}

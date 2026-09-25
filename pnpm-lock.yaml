@@ -41,6 +41,9 @@ importers:
       '@hearth/interpreter':
         specifier: workspace:*
         version: link:../../packages/interpreter
+      '@hearth/openclaw-adapter':
+        specifier: workspace:*
+        version: link:../../packages/openclaw-adapter
       '@hearth/registry':
         specifier: workspace:*
         version: link:../../packages/registry
@@ -178,6 +181,21 @@ importers:
         specifier: workspace:*
         version: link:../registry
     devDependencies:
+      '@types/node':
+        specifier: 22.10.5
+        version: 22.10.5
+      typescript:
+        specifier: 5.6.3
+        version: 5.6.3
+      vitest:
+        specifier: 2.1.9
+        version: 2.1.9(@types/node@22.10.5)(jsdom@25.0.1)
+
+  packages/openclaw-adapter:
+    devDependencies:
+      '@hearth/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@types/node':
         specifier: 22.10.5
         version: 22.10.5

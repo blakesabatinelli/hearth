@@ -24,6 +24,7 @@
     "@hearth/extractor": "workspace:*",
     "@hearth/ha-adapter": "workspace:*",
     "@hearth/interpreter": "workspace:*",
+    "@hearth/openclaw-adapter": "workspace:*",
     "@hearth/registry": "workspace:*",
     "@hearth/scheduler": "workspace:*",
     "fastify": "5.1.0"

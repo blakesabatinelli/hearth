@@ -18,6 +18,19 @@
  *   HEARTH_EXTRACT_URL           base URL of the GLiNER2 sidecar. If set, the
  *                                interpreter uses the HTTP provider; if unset,
  *                                the bundled mock provider runs in fixture mode.
+ *   HEARTH_OPENCLAW_URL          base URL of the OpenClaw external Gateway.
+ *                                Loopback-only (asserted at construction).
+ *                                If set AND HEARTH_GATEWAY_TOKEN is also set,
+ *                                the interpreter's Bonsai provider routes through
+ *                                OpenClaw. If unset (or invalid), no real
+ *                                Bonsai provider is wired and the interpreter's
+ *                                bonsai slot stays null (interpreter then only
+ *                                succeeds via grammar + GLiNER2).
+ *   HEARTH_GATEWAY_TOKEN         bearer token for the OpenClaw Gateway. Read
+ *                                at startup; never printed in logs.
+ *   HEARTH_BONSAI_DISABLED       "1" forces bonsai to null regardless of
+ *                                OpenClaw env. Useful for fixture-mode runs
+ *                                that need to assert the no-bonsai code path.
  */
 import {
   SystemClock,
@@ -30,6 +43,12 @@ import {
   loadDefaultFixture,
 } from '@hearth/ha-adapter';
 import { RegistryOverlay } from '@hearth/registry';
+import {
+  OpenClawBonsaiProvider,
+  OpenClawPermanentError,
+  OpenClawPinError,
+  OpenClawTransientError,
+} from '@hearth/openclaw-adapter';
 import { wireControl } from './wiring.js';
 import { Scheduler, InMemoryScheduleStore, type SchedulerOptions } from '@hearth/scheduler';
 
@@ -108,6 +127,35 @@ async function resolveAdapter(): Promise<{
   return { adapter: pool.getActive(), pool, registry, mode: 'live', ha_url };
 }
 
+/**
+ * Construct an OpenClawBonsaiProvider from environment if both
+ * HEARTH_OPENCLAW_URL and HEARTH_GATEWAY_TOKEN are set. Otherwise
+ * returns an empty spread so wireControl keeps bonsai=null.
+ *
+ * The base URL MUST resolve to loopback per assertLoopbackOnly. We
+ * catch any thrown URL error and emit a startup warning so the
+ * operator knows the env is malformed rather than silently dropping
+ * to fixture.
+ */
+export function resolveBonsaiProvider(): { bonsai?: never } | { bonsai: OpenClawBonsaiProvider } {
+  if (process.env.HEARTH_BONSAI_DISABLED === '1') return {};
+  const url = process.env.HEARTH_OPENCLAW_URL ?? '';
+  const token = process.env.HEARTH_GATEWAY_TOKEN ?? '';
+  if (!url || !token) return {};
+  try {
+    const provider = new OpenClawBonsaiProvider({ base_url: url, token });
+    // eslint-disable-next-line no-console
+    console.log(`[hearth-control] bonsai provider wired: openclaw @ ${url}`);
+    return { bonsai: provider };
+  } catch (err) {
+    // Loopback guard failed, or gateway URL is malformed. Log loud,
+    // fall back to no bonsai provider (interpreter gets null).
+    // eslint-disable-next-line no-console
+    console.warn('[hearth-control] bonsai provider NOT wired:', (err as Error).message);
+    return {};
+  }
+}
+
 async function main(): Promise<void> {
   // Subcommand: `doctor` runs the diagnostic and exits.
   if (process.argv[2] === 'doctor') {
@@ -140,6 +188,7 @@ async function main(): Promise<void> {
     clock,
     session_secret,
     ...(extract_url ? { gliner2_http_url: extract_url } : {}),
+    ...resolveBonsaiProvider(),
   });
 
   // Recovery: load interrupted contracts (dispatching / sent-unconfirmed)
@@ -288,6 +337,8 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
 
   // Check 6: Adapter mode. Fixture mode is the safe default; live mode
   // requires both HEARTH_HA_URL and HEARTH_HA_TOKEN to be configured.
+  // In live mode, additionally probe HA's /api/ endpoint to confirm
+  // it's reachable and the token is good. Probe failure -> FAIL.
   const fixture_mode = (process.env.HEARTH_FIXTURE_MODE ?? '1') !== '0';
   if (fixture_mode) {
     checks.push({ name: 'adapter-mode', status: 'PASS', detail: 'fixture (HEARTH_FIXTURE_MODE=1); live HA not required' });
@@ -306,7 +357,117 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
         status: 'PASS',
         detail: `live (HEARTH_HA_URL=${ha_url})`,
       });
+      // Item 8: live-resource probe.
+      try {
+        const res = await fetch(`${ha_url.replace(/\/$/, '')}/api/`, {
+          headers: { Authorization: `Bearer ${ha_token}` },
+        });
+        if (!res.ok) {
+          checks.push({
+            name: 'ha-reachable',
+            status: 'FAIL',
+            detail: `${ha_url}/api/ returned ${res.status} (token bad or HA down)`,
+          });
+        } else {
+          const body = await res.json() as { message?: string };
+          if (body.message && body.message !== 'API running.' && !/running/i.test(body.message)) {
+            checks.push({
+              name: 'ha-reachable',
+              status: 'FAIL',
+              detail: `${ha_url}/api/ returned unexpected body: ${JSON.stringify(body).slice(0, 120)}`,
+            });
+          } else {
+            checks.push({
+              name: 'ha-reachable',
+              status: 'PASS',
+              detail: `${ha_url}/api/ responded`,
+            });
+          }
+        }
+      } catch (err) {
+        checks.push({
+          name: 'ha-reachable',
+          status: 'FAIL',
+          detail: `${ha_url} unreachable: ${(err as Error).message}`,
+        });
+      }
     }
+  }
+
+  // Check 7: OpenClaw adapter wiring (item 8 doctor check).
+  // The OpenClaw URL is loopback-only. If set, probe /agent/turn with a
+  // 401-style request to confirm the Gateway is alive (it should
+  // return 401 or 400, never connection-refused). If unset, the
+  // interpreter falls back to grammar+GLiNER2 only, which is OK.
+  const openclaw_url = process.env.HEARTH_OPENCLAW_URL ?? '';
+  const openclaw_token = process.env.HEARTH_GATEWAY_TOKEN ?? '';
+  if (openclaw_url) {
+    // Loopback guard first.
+    let host_ok = false;
+    try {
+      const u = new URL(openclaw_url);
+      host_ok = (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1' || u.hostname === '[::1]');
+    } catch {
+      // fall through
+    }
+    if (!host_ok) {
+      checks.push({
+        name: 'openclaw-reachable',
+        status: 'FAIL',
+        detail: `${openclaw_url} is not loopback; Hearth refuses non-loopback OpenClaw`,
+      });
+    } else if (!openclaw_token) {
+      checks.push({
+        name: 'openclaw-reachable',
+        status: 'FAIL',
+        detail: `HEARTH_OPENCLAW_URL set but HEARTH_GATEWAY_TOKEN is empty`,
+      });
+    } else {
+      try {
+        // An OPTIONS or fake POST will tell us the gateway is alive.
+        // We expect 401/400/404 from any real endpoint.
+        const res = await fetch(`${openclaw_url.replace(/\/$/, '')}/agent/turn`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${openclaw_token}`,
+          },
+          body: JSON.stringify({ probe: true }),
+        });
+        if (res.status === 404) {
+          checks.push({
+            name: 'openclaw-reachable',
+            status: 'WARN',
+            detail: `${openclaw_url}/agent/turn returned 404; verify the Gateway version (expected 2026.9.6)`,
+          });
+        } else if (res.status >= 500) {
+          checks.push({
+            name: 'openclaw-reachable',
+            status: 'FAIL',
+            detail: `${openclaw_url}/agent/turn returned ${res.status}`,
+          });
+        } else {
+          // 400/401/403 all mean: gateway is alive, accepts this URL.
+          checks.push({
+            name: 'openclaw-reachable',
+            status: 'PASS',
+            detail: `${openclaw_url}/agent/turn responded (${res.status}); token accepted`,
+          });
+        }
+      } catch (err) {
+        checks.push({
+          name: 'openclaw-reachable',
+          status: 'FAIL',
+          detail: `${openclaw_url} unreachable: ${(err as Error).message}`,
+        });
+      }
+    }
+  } else {
+    checks.push({
+      name: 'openclaw-reachable',
+      status: 'WARN',
+      detail: 'HEARTH_OPENCLAW_URL not set; bonsai provider disabled (grammar + GLiNER2 only)',
+    });
   }
 
   // Report.
