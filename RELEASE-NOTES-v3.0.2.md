@@ -19,6 +19,10 @@ step.
   PASSes if the binding is present, FAILs with the rebuild hint otherwise.
 - **`scripts/install.sh`** defaults to `<owner>/hearth.git` so a fresh
   install does not embed the GitHub org/user.
+- **`apps/web/README.md`** and **`docs/macos-host-setup.md`** are now
+  tracked on `main` (they were created during v3.0.1 work and the QA
+  #6 regression test asserts the PWA README exists). Both are scrubbed
+  of personal references.
 
 ## Tests
 
