@@ -16,10 +16,41 @@ set -euo pipefail
 CONTROL_URL="${HEARTH_CONTROL_URL:-http://127.0.0.1:8787}"
 EXTRACT_URL="${HEARTH_EXTRACT_URL:-}"
 SQLITE_PATH="${HEARTH_SQLITE_PATH:-}"
+DATA_DIR="${HEARTH_DATA_DIR:-}"
 
 fail=0
 pass=0
 warn=0
+
+# Define check() before any caller. Bash resolves function names at
+# call time, but only after the function has been sourced. The native-
+# binding and sidecar checks below call check() early in the script;
+# the original ordering defined check() mid-script and surfaced as
+# 'check: command not found' on real installs.
+check() {
+  local name="$1"; shift
+  local status="$1"; shift
+  local detail="$1"; shift || true
+  case "$status" in
+    PASS) pass=$((pass + 1)); icon="OK"; color="\033[32m" ;;
+    WARN) warn=$((warn + 1)); icon="WARN"; color="\033[33m" ;;
+    FAIL) fail=$((fail + 1)); icon="FAIL"; color="\033[31m" ;;
+    *) echo "doctor.sh: bad status $status" >&2; exit 2 ;;
+  esac
+  printf "${color}[%s] %s\033[0m" "$icon" "$name"
+  if [[ -n "$detail" ]]; then
+    printf ": %s" "$detail"
+  fi
+  printf "\n"
+}
+
+http_status() {
+  curl -fsS -o /dev/null -w "%{http_code}" --max-time 5 "$1" 2>/dev/null || echo "000"
+}
+
+http_body() {
+  curl -fsS --max-time 5 "$1" 2>/dev/null || true
+}
 
 # 0. Native binding sanity check (better-sqlite3).
 # pnpm 9+ skips postinstall scripts unless the package is whitelisted in
@@ -52,31 +83,9 @@ else
   check "gliner2 sidecar importable" FAIL "${extract_venv} not built; rerun scripts/install.sh"
 fi
 
-check() {
-  local name="$1"; shift
-  local status="$1"; shift
-  local detail="$1"; shift || true
-  case "$status" in
-    PASS) pass=$((pass + 1)); icon="OK"; color="\033[32m" ;;
-    WARN) warn=$((warn + 1)); icon="WARN"; color="\033[33m" ;;
-    FAIL) fail=$((fail + 1)); icon="FAIL"; color="\033[31m" ;;
-    *) echo "doctor.sh: bad status $status" >&2; exit 2 ;;
-  esac
-  printf "${color}[%s] %s\033[0m" "$icon" "$name"
-  if [[ -n "$detail" ]]; then
-    printf ": %s" "$detail"
-  fi
-  printf "\n"
-}
-
-http_status() {
-  curl -fsS -o /dev/null -w "%{http_code}" --max-time 5 "$1" 2>/dev/null || echo "000"
-}
-
-# 1. control reachable
-http_body() {
-  curl -fsS --max-time 5 "$1" 2>/dev/null || true
-}
+# Sidecar reachability is reported further down. The HTTP probe here
+# would race the sidecar's GLiNER2-checkpoint load on first run; the
+# importable check above is the right gate for "is the venv real?".
 
 ctl_status=$(http_status "${CONTROL_URL}/healthz")
 if [[ "$ctl_status" == "200" ]]; then
@@ -108,14 +117,23 @@ fi
 
 # 4. SQLite writable
 if [[ -n "$SQLITE_PATH" ]]; then
-  if [[ -f "$SQLITE_PATH" ]]; then
+  # The database may not exist yet; the parent directory must exist
+  # and be writable, otherwise the first write will fail.
+  parent_dir="$(dirname "$SQLITE_PATH")"
+  if [[ ! -d "$parent_dir" ]]; then
+    if [[ -n "$DATA_DIR" && -d "$DATA_DIR" ]]; then
+      check "sqlite database parent dir" WARN "missing; data dir $DATA_DIR exists, doctor cannot create the database file automatically"
+    else
+      check "sqlite database parent dir" FAIL "missing: $parent_dir (set HEARTH_DATA_DIR and mkdir -p it)"
+    fi
+  elif [[ -f "$SQLITE_PATH" ]]; then
     if [[ -w "$SQLITE_PATH" ]]; then
       check "sqlite database writable" PASS "$SQLITE_PATH"
     else
       check "sqlite database writable" FAIL "$SQLITE_PATH not writable"
     fi
   else
-    check "sqlite database writable" WARN "$SQLITE_PATH does not exist yet"
+    check "sqlite database writable" WARN "$SQLITE_PATH does not exist yet (parent $parent_dir writable)"
   fi
 else
   check "sqlite database path configured" WARN "HEARTH_SQLITE_PATH not set; default in-memory store"
