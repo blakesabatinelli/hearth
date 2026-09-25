@@ -93,6 +93,10 @@ sed -n '1,240p' STATE.md
 
 ## 2. Create installation-local directories
 
+These variables are referenced throughout this guide. Either run them
+in every shell before continuing, or persist them in `~/.zshenv` so they
+load on every new shell.
+
 ```bash
 export HEARTH_RUNTIME_ROOT="$HOME/Library/Application Support/Hearth"
 export HEARTH_MODEL_DIR="$HEARTH_RUNTIME_ROOT/models/bonsai"
@@ -100,11 +104,18 @@ export HEARTH_DATA_DIR="$HEARTH_RUNTIME_ROOT/data"
 export HEARTH_LOG_DIR="$HEARTH_RUNTIME_ROOT/logs"
 export HEARTH_SECRET_DIR="$HEARTH_RUNTIME_ROOT/secrets"
 
-mkdir -p "$HEARTH_MODEL_DIR"
-mkdir -p "$HEARTH_DATA_DIR"
-mkdir -p "$HEARTH_LOG_DIR"
-mkdir -p "$HEARTH_SECRET_DIR"
+# Optional but recommended: re-export on every new shell.
+# Add the four HEARTH_*_DIR lines above to ~/.zshenv if you want them
+# to persist across shells.
+
+mkdir -p "$HEARTH_MODEL_DIR" "$HEARTH_DATA_DIR" "$HEARTH_LOG_DIR" "$HEARTH_SECRET_DIR"
 chmod 700 "$HEARTH_RUNTIME_ROOT" "$HEARTH_SECRET_DIR"
+
+# Verify the variable expanded to a real path. If this prints '/...'
+# instead of '$HOME/Library/.../secrets', the variable was not set
+# in this shell; re-export from section 2 or source ~/.zshenv.
+: "${HEARTH_SECRET_DIR:?HEARTH_SECRET_DIR is not set - re-run section 2 in this shell}"
+echo "HEARTH_SECRET_DIR=$HEARTH_SECRET_DIR"
 ```
 
 Keep weights, databases, logs, and secrets outside the Git repository.
@@ -265,12 +276,17 @@ Expected version:
 OpenClaw 2026.9.6
 ```
 
-Create a Gateway token without printing it:
+Create a Gateway token without printing it. If `$HEARTH_SECRET_DIR`
+is unset, the redirect would target `/openclaw-gateway-token` on the
+read-only system root, so guard explicitly:
 
 ```bash
 umask 077
+: "${HEARTH_SECRET_DIR:?must be set - re-run section 2 in this shell}"
 openssl rand -hex 32 > "$HEARTH_SECRET_DIR/openclaw-gateway-token"
+chmod 600 "$HEARTH_SECRET_DIR/openclaw-gateway-token"
 export OPENCLAW_GATEWAY_TOKEN="$(< "$HEARTH_SECRET_DIR/openclaw-gateway-token")"
+echo "Wrote gateway token to $HEARTH_SECRET_DIR/openclaw-gateway-token (umask 077, 600)"
 ```
 
 Configure OpenClaw to use the already-running Bonsai server:
@@ -480,14 +496,18 @@ In Home Assistant:
 4. Name it `Hearth host Mac`.
 5. Copy the token once.
 
-Back in Terminal, store it without echoing it:
+Back in Terminal, store it without echoing it. If `$HEARTH_SECRET_DIR`
+is unset, the redirect would target `/home-assistant-token` on the
+read-only system root, so guard explicitly:
 
 ```bash
+: "${HEARTH_SECRET_DIR:?must be set - re-run section 2 in this shell}"
 read -s "HEARTH_HA_TOKEN_INPUT?Paste the Home Assistant token: "
 printf '\n'
 printf '%s\n' "$HEARTH_HA_TOKEN_INPUT" > "$HEARTH_SECRET_DIR/home-assistant-token"
 chmod 600 "$HEARTH_SECRET_DIR/home-assistant-token"
 unset HEARTH_HA_TOKEN_INPUT
+echo "Wrote Home Assistant token to $HEARTH_SECRET_DIR/home-assistant-token (600)"
 ```
 
 Set the URL for the current Terminal session:
@@ -529,16 +549,20 @@ Do not send service calls during setup. Device actuation remains fixture-only un
 
 The current application starts only with the synthetic Home Assistant fixture and mock GLiNER2 provider. This is useful for verifying the checked-in code, but it is not the live integration.
 
-Create a session secret and database location:
+Create a session secret and database location. The same `$HEARTH_SECRET_DIR`
+guard applies:
 
 ```bash
 umask 077
+: "${HEARTH_SECRET_DIR:?must be set - re-run section 2 in this shell}"
 openssl rand -hex 32 > "$HEARTH_SECRET_DIR/hearth-session-secret"
+chmod 600 "$HEARTH_SECRET_DIR/hearth-session-secret"
 export HEARTH_SESSION_SECRET="$(< "$HEARTH_SECRET_DIR/hearth-session-secret")"
 export HEARTH_SQLITE_PATH="$HEARTH_DATA_DIR/hearth.sqlite"
 export HEARTH_HOST=127.0.0.1
 export HEARTH_PORT=8787
 export HEARTH_EXTRACT_URL=http://127.0.0.1:8770
+echo "Wrote session secret to $HEARTH_SECRET_DIR/hearth-session-secret (600)"
 ```
 
 Open another Terminal window and start the control API:
@@ -546,10 +570,13 @@ Open another Terminal window and start the control API:
 ```bash
 export HEARTH_REPO="$HOME/src/hearth"
 cd "$HEARTH_REPO"
+# If you persisted the HEARTH_*_DIR lines to ~/.zshenv, these next
+# three exports are redundant; they are written here for clarity
+# when running the API in a fresh shell.
 export HEARTH_RUNTIME_ROOT="$HOME/Library/Application Support/Hearth"
 export HEARTH_DATA_DIR="$HEARTH_RUNTIME_ROOT/data"
 export HEARTH_SECRET_DIR="$HEARTH_RUNTIME_ROOT/secrets"
-export HEARTH_SESSION_SECRET="$(< "$HEARTH_SECRET_DIR/hearth-session-secret")"
+: "${HEARTH_SESSION_SECRET:?must be set - run section 12's secret-creation block in this shell}"
 export HEARTH_SQLITE_PATH="$HEARTH_DATA_DIR/hearth.sqlite"
 export HEARTH_HOST=127.0.0.1
 export HEARTH_PORT=8787
