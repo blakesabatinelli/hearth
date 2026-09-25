@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-REPO_URL="${HEARTH_REPO:-https://github.com/blakesabatinelli/hearth.git}"
+REPO_URL="${HEARTH_REPO:-https://github.com/<owner>/hearth.git}"
 INSTALL_DIR="${HEARTH_DIR:-/opt/hearth}"
 SERVICE_USER="${HEARTH_USER:-hearth}"
 
@@ -70,6 +70,18 @@ build_project() {
   echo ">>> pnpm install"
   cd "${INSTALL_DIR}"
   pnpm install --frozen-lockfile
+  echo ">>> pnpm rebuild better-sqlite3"
+  # pnpm 10 honors pnpm.onlyBuiltDependencies but on a fresh Debian box with
+  # libsqlite3-0 just installed, force-rebuilding the native binding removes
+  # any race with the prebuilt-download step. If this fails, the doctor will
+  # catch it on the next line.
+  pnpm rebuild better-sqlite3 || true
+  binding="$(find "${INSTALL_DIR}/node_modules" -path '*better-sqlite3*/build/Release/better_sqlite3.node' 2>/dev/null | head -1)"
+  if [[ -z "${binding}" ]]; then
+    echo ">>> FATAL: better-sqlite3 native binding was not built." >&2
+    echo ">>> Run: pnpm rebuild better-sqlite3 (and ensure libsqlite3-dev is installed)" >&2
+    exit 1
+  fi
   echo ">>> pnpm build"
   pnpm -r --filter './packages/*' --filter './apps/*' build
   echo ">>> pnpm test (sanity)"

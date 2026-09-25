@@ -21,6 +21,22 @@ fail=0
 pass=0
 warn=0
 
+# 0. Native binding sanity check (better-sqlite3).
+# pnpm 9+ skips postinstall scripts unless the package is whitelisted in
+# pnpm.onlyBuiltDependencies. If the binding failed to download/build at
+# install time, every SqliteExecutionStore test fails with "Could not
+# locate the bindings file". Surface this loudly here.
+if [[ -d "node_modules" ]]; then
+  binding=$(find node_modules -path '*better-sqlite3*/build/Release/better_sqlite3.node' 2>/dev/null | head -1)
+  if [[ -n "$binding" ]]; then
+    check "better-sqlite3 native binding" PASS "$binding"
+  else
+    check "better-sqlite3 native binding" FAIL "binding missing - run: pnpm rebuild better-sqlite3"
+  fi
+else
+  check "better-sqlite3 native binding" WARN "node_modules not installed yet"
+fi
+
 check() {
   local name="$1"; shift
   local status="$1"; shift
