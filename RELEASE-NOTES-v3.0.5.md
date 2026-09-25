@@ -28,7 +28,7 @@ before passing.
 verifier green. The Python sidecar itself is not unit-tested; the
 test totals do not change for this release. End-to-end validation
 against the deployment host's GLiNER2 checkpoint is what proves the
-fix — see "How to verify" below.
+fix - see "How to verify" below.
 
 ## How to verify on the deployment host
 
@@ -40,7 +40,7 @@ git pull origin main
 pkill -9 -f 'uvicorn hearth_extract' 2>/dev/null || true
 sleep 1
 
-# Start fresh — picks up the v3.0.5 sidecar code automatically
+# Start fresh - picks up the v3.0.5 sidecar code automatically
 apps/extract/.venv/bin/uvicorn hearth_extract:app \
   --host 127.0.0.1 --port 8770 \
   > /tmp/hearth-extract.log 2>&1 &

@@ -437,9 +437,71 @@ Do not treat `/health` alone as proof. The `/extract` request must return HTTP 2
 
 ## 10. Install Home Assistant OS
 
-If the household already has Home Assistant, do not create a second instance and do not re-pair any Hue or SmartThings devices. Skip to the token section and use the existing URL.
+If the household already has Home Assistant, do not create a second instance and do not re-pair any Hue or SmartThings devices. Skip to section 11 (token creation) and use the existing URL.
 
-For a new local installation on Apple Silicon, use the supported Home Assistant OS virtual-machine route.
+For a new local installation on Apple Silicon, two routes are supported:
+
+### 10a. Recommended: Home Assistant Container via Docker
+
+This is the lightest path on macOS. No virtual machine, no extra kernel modules, no re-pairing of devices. Home Assistant runs as a Docker container on `127.0.0.1:8123` and Hearth reaches it over loopback.
+
+```bash
+# Install Docker Desktop if it is not already present.
+brew install --cask docker
+open -a Docker
+# Wait for Docker to finish starting (the whale icon in the menu bar
+# stops animating). On Apple Silicon this takes 10-30 seconds.
+
+# Run Home Assistant Container on the host network so mDNS works and
+# the container sees the LAN. The first boot pulls the HA image and
+# writes an empty config under ~/ha-config/.
+docker run -d \
+  --name homeassistant \
+  --restart=unless-stopped \
+  --network=host \
+  -v ~/ha-config:/config \
+  -e TZ="$(systemsetup -gettimezone 2>/dev/null | awk -F': ' '{print $2}')" \
+  homeassistant/home-assistant:stable
+
+# Wait for HA to finish first boot. This can take 60-180 seconds.
+for i in $(seq 1 60); do
+  if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8123 2>/dev/null; then
+    echo "Home Assistant reachable after ${i}*3s"
+    break
+  fi
+  sleep 3
+done
+```
+
+Open the onboarding UI:
+
+```bash
+open http://127.0.0.1:8123
+```
+
+Complete onboarding in the browser. Add the existing Hue and SmartThings integrations through Home Assistant. **Do not reset bridges, remove existing accounts, or re-pair devices.**
+
+The control service connects to this HA instance via:
+
+```bash
+export HEARTH_HA_URL="http://127.0.0.1:8123"
+```
+
+When you want to stop the HA container:
+
+```bash
+docker stop homeassistant
+```
+
+When you want to remove it (the config persists under `~/ha-config/`):
+
+```bash
+docker rm homeassistant
+```
+
+### 10b. Optional: Home Assistant OS in a VirtualBox VM
+
+Only use this path if you specifically need HA OS (for example, to run add-ons that require the supervisor). It is heavier than the Docker path and not required for Hearth.
 
 Install VirtualBox:
 
@@ -448,7 +510,7 @@ brew install --cask virtualbox
 open -a VirtualBox
 ```
 
-In a browser, open the official macOS installation page:
+In a browser, open the official installation page:
 
 ```bash
 open https://www.home-assistant.io/installation/macos
@@ -484,7 +546,22 @@ If that hostname does not resolve, use the IP address displayed by the VM:
 open http://<home-assistant-ip>:8123
 ```
 
-Complete Home Assistant onboarding in the browser. Add the existing Hue and SmartThings integrations through Home Assistant. Do not reset bridges, remove existing accounts, or re-pair devices.
+The control service connects to this HA instance via:
+
+```bash
+export HEARTH_HA_URL="http://homeassistant.local:8123"
+# (or the IP from the VM console if mDNS does not work)
+```
+
+Complete Home Assistant onboarding in the browser. Add the existing Hue and SmartThings integrations through Home Assistant. **Do not reset bridges, remove existing accounts, or re-pair devices.**
+
+To shut the HA VM down cleanly:
+
+```bash
+# From the HA UI: Settings -> System -> Power Button -> Shut down.
+# Or from the VM console in VirtualBox: Machine -> ACPI Shutdown.
+# Do not force-stop during database writes.
+```
 
 ## 11. Create and verify a Home Assistant token
 
@@ -644,7 +721,11 @@ Stop the OpenClaw LaunchAgent with:
 openclaw gateway stop
 ```
 
-Shut down the Home Assistant VM from Home Assistant or VirtualBox. Do not force-stop it during database writes.
+If you used the VirtualBox route for Home Assistant (section 10b), shut
+down the HA VM from Home Assistant (Settings -> System -> Power Button
+-> Shut down) or from VirtualBox (Machine -> ACPI Shutdown). Do not
+force-stop during database writes. If you used the Docker route
+(section 10a), stop the container with `docker stop homeassistant`.
 
 ## 15. Primary references
 
