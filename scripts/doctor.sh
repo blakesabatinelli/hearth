@@ -37,6 +37,21 @@ else
   check "better-sqlite3 native binding" WARN "node_modules not installed yet"
 fi
 
+# 0b. GLiNER2 sidecar venv sanity check. Without this venv, /v1/extract
+# requests 500 with 'No module named torch' or similar. The smoke test
+# just imports AutoExtractor; loading the checkpoint happens at sidecar
+# startup, which is faster to verify separately.
+extract_venv="apps/extract/.venv"
+if [[ -d "${extract_venv}" ]]; then
+  if "${extract_venv}/bin/python" -c "from gliner2 import AutoExtractor" 2>/dev/null; then
+    check "gliner2 sidecar importable" PASS "${extract_venv}"
+  else
+    check "gliner2 sidecar importable" FAIL "${extract_venv}/bin/python cannot import gliner2; rerun scripts/install.sh"
+  fi
+else
+  check "gliner2 sidecar importable" FAIL "${extract_venv} not built; rerun scripts/install.sh"
+fi
+
 check() {
   local name="$1"; shift
   local status="$1"; shift

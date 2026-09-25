@@ -1,0 +1,44 @@
+# apps/extract/requirements.txt
+#
+# Pinned dependency set for the GLiNER2 sidecar. Used by scripts/install.sh
+# (from-source installs) and as the canonical reference for which Python
+# packages are required at runtime.
+#
+# Source of truth:
+#   - pyproject.toml [project.dependencies] for the named pins
+#   - gliner2[local] extra for torch / peft / accelerate / safetensors / etc.
+#   - models/gliner2.lock.json for the checkpoint id (NOT a pip dep)
+#
+# Update procedure:
+#   1. Bump the version in pyproject.toml
+#   2. Run a fresh `python -m venv .venv && .venv/bin/pip install -e .` in
+#      a clean venv; copy the resolved set into this file with
+#      `.venv/bin/pip freeze > requirements.txt`
+#   3. Re-run scripts/install.sh on a Debian 12 box and confirm
+#      `apps/extract/.venv/bin/python -c "from gliner2 import AutoExtractor"`
+#      succeeds.
+
+# Core sidecar framework
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.32.0,<1.0
+pydantic>=2.9.0,<3.0
+
+# GLiNER2 v2 + its `[local]` extra deps (torch, peft, accelerate, ...)
+# Pinned to the same range as pyproject.toml; check the lock for the
+# exact checkpoint at runtime.
+gliner2[local]>=2.0.0,<3.0.0
+
+# protobuf is required by gliner2's tokenizer protobuf files but is not
+# declared as a hard dep in gliner2==2.0.0; pin it here so a fresh venv
+# does not fail on 'No module named google.protobuf'.
+protobuf>=4.25.0,<6.0.0
+
+# torch on CPU for the deployment host. The default `gliner2[local]` install
+# pulls the CUDA build, which is several GB and breaks on hosts without
+# a matching CUDA driver. Override with --index-url below for the
+# production-from-source install path. The Dockerfile uses the same
+# override.
+#
+# Note: this is the minimum-runtime override. If the deployment host has a
+# GPU and a matching CUDA toolchain, drop this entry and let gliner2[local]
+# pull the default torch wheel.

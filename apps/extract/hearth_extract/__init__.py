@@ -106,16 +106,34 @@ async def extract(req: ExtractRequest) -> dict:
     # Build the schema dict for gliner2 from the request. Schema-driven
     # by design: pass only the entity types and labels relevant to this
     # request (built hearth-side from registry + active categories).
+    # gliner2 v2.0.0's `extract(text, schema, threshold)` accepts a
+    # dict with keys {"entities", "classifications", "relations"} —
+    # passing entity_types= and labels= as kwargs is the v1 API and
+    # raises TypeError against the pinned v2.0.0 release.
     schema = {
         "entities": req.schema_in.entity_types,
         "classifications": req.schema_in.classification_labels,
+        "relations": req.schema_in.relations,
     }
     try:
         result = _extractor.extract(  # type: ignore
             req.utterance,
-            entity_types=req.schema_in.entity_types,
-            labels=req.schema_in.classification_labels,
+            schema=schema,
+            threshold=0.5,
         )
+    except TypeError as e:
+        # Fallback: some legacy checkpoints still expose
+        # extract_entities(text, [entity_types], threshold). Detect at
+        # runtime so a checkpoint change doesn't break the sidecar.
+        if "entity_types" in str(e) and hasattr(_extractor, "extract_entities"):
+            result = _extractor.extract_entities(  # type: ignore
+                req.utterance,
+                req.schema_in.entity_types,
+                threshold=0.5,
+            )
+        else:
+            log.exception("gliner2 extract TypeError")
+            raise HTTPException(status_code=500, detail=f"extract failed: {e}") from e
     except Exception as e:
         log.exception("gliner2 extract failed")
         raise HTTPException(status_code=500, detail=f"extract failed: {e}") from e

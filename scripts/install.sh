@@ -86,6 +86,38 @@ build_project() {
   pnpm -r --filter './packages/*' --filter './apps/*' build
   echo ">>> pnpm test (sanity)"
   pnpm -r --if-present test
+  echo ">>> setting up the GLiNER2 sidecar venv"
+  install_gliner2_sidecar
+}
+
+install_gliner2_sidecar() {
+  # The hearth-extract Python sidecar lives at apps/extract/. It is
+  # called by hearth-control over local HTTP. Without this venv the
+  # sidecar is missing torch/peft/protobuf and any extract request
+  # 500s. This block is idempotent: re-running skips when the venv
+  # already has the sidecar installed.
+  local extract_dir="${INSTALL_DIR}/apps/extract"
+  local venv="${extract_dir}/.venv"
+  if [[ ! -d "${venv}" ]]; then
+    python3 -m venv "${venv}"
+    "${venv}/bin/python" -m pip install --upgrade \
+      "pip<25" "setuptools<80" wheel
+  fi
+  # CPU-only torch for the from-source install path. The Dockerfile
+  # does the same; this keeps the sidecar loadable on a host without
+  # a CUDA toolchain. Drop --index-url for a GPU build.
+  "${venv}/bin/pip" install --upgrade \
+    -r "${extract_dir}/requirements.txt" \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+  # Editable install of the sidecar itself so `hearth-extract` is on
+  # PATH and `from hearth_extract import ...` resolves.
+  "${venv}/bin/pip" install --editable "${extract_dir}" --no-deps
+  # Smoke test the venv before declaring the install complete.
+  if ! "${venv}/bin/python" -c "from gliner2 import AutoExtractor" 2>/dev/null; then
+    echo ">>> WARN: gliner2 import failed in ${venv}" >&2
+    echo ">>>    The control service will run; the extract sidecar will" >&2
+    echo ">>>    report degraded and Ask will fall back to grammar-only." >&2
+  fi
 }
 
 print_next_steps() {
