@@ -708,6 +708,33 @@ These are code changes, not additional setup commands:
 
 Until those changes land, keep Home Assistant read-only from Hearth and keep household actuation disabled.
 
+### Items landed in v3.0.10 (this branch)
+
+The following items from the punch list above have been implemented and unit-tested against fixture gates (live-resource tests still need to be run on the deployment Mac; see below for operator commands):
+
+1. **Real HA adapter (item 1):** `packages/ha-adapter/src/live.ts` implements REST endpoints (`/api/`, `/api/states`, `/api/areas`, `/api/registry`, `/api/services/<domain>/<service>`, `/api/states/<entity_id>`) with a WebSocket subscribe scaffold. Areas + entity-registry + states are mapped into Hearth's `DeviceRecord` / `Room` shapes. Sensors are filtered out of `listDevices()` because they have no commands. The `HAConnectionPool` accepts an `(seed, 'ha', adapter)` overload so `main.ts` can swap in the live adapter.
+2. **Env-driven control service (item 2):** `apps/control/src/main.ts` reads `HEARTH_FIXTURE_MODE` (default `'1'`, safe), `HEARTH_HA_URL`, and `HEARTH_HA_TOKEN`. Live mode is fail-closed: it requires both env vars and a working `probe()` of `HEARTH_HA_URL`.
+3. **`HEARTH_EXTRACT_URL` plumbed (item 3):** `main.ts` reads the variable and threads it through `wireControl()` via conditional spread so the interpreter's GLiNER2 provider runs against the real sidecar when set.
+4. **GLiNER2 schema translation (item 4):** `apps/extract/hearth_extract/__init__.py` calls the pinned `gliner2==2.0.0` API using `schema=...` (not `entity_types=...`).
+5. **`packages/openclaw-adapter/` (item 5):** Loopback-only `OpenClawBonsaiProvider`. No actuation tools, no shell, no browser, no general HTTP, no household credentials, no executor DB access. Pure JSON-schema-constrained Bonsai proposer against `http://127.0.0.1` (or `[::1]`).
+6. **`BonsaiProvider` through the adapter (item 6):** Implements `BonsaiProvider.propose()` + `validateProposal()`. One retry on transient 5xx; never retry on validation failure. Server-side strict JSON-Schema validation; invalid output -> `ProposalValidationError`, never silent repair.
+7. **`models/openclaw.lock.json` (item 7, partial):** Source file lives at `packages/openclaw-adapter/src/lock.ts` (TS module so the build verifies structure). `pinned_version` is `HEARTH_OPENCLAW_PIN` (drift-proof); `commit_sha` + `llama_cpp_commit_sha` are operator-fillable (`PENDING_OPERATOR_VERIFICATION`). Release-time verification (`HEARTH_RELEASE=1`) requires real SHAs. `models/bonsai.lock.json` remains a stub awaiting operator measurements.
+8. **Doctor checks for live resources (item 8):** `apps/control/src/main.ts` doctor adds `ha-reachable` (live-mode `/api/` probe) and `openclaw-reachable` (`/agent/turn` probe + loopback guard + token guard). `scripts/verify-openclaw-lock.mjs` verifier checks the lock structure.
+9. **Stage 0 round-trip (item 9):** `apps/control/tests/round-trip.test.ts` exercises the full chain against an in-process HTTP server pretending to be OpenClaw, validating that `propose()` -> `validateProposal()` -> `IntentProposal` round-trips correctly with retry, pin drift, and invalid-output rejection.
+10. **Stage 3 evaluation (item 10):** Not yet implemented. See evaluation harness section in this same doc (forthcoming) for the operator commands to construct the corpus.
+
+### Operator follow-up before claiming live Hearth
+
+Until the operator completes the following on the deployment Mac, the doctor cannot turn the `openclaw-reachable` and `ha-reachable` checks PASS in live mode:
+
+- **Home Assistant live verification.** With `HEARTH_FIXTURE_MODE=0`, `HEARTH_HA_URL=http://127.0.0.1:8123`, and the long-lived token in `HEARTH_HA_TOKEN`, the doctor should report `[OK] ha-reachable`. The `LiveHAAdapter` is wired through `HAConnectionPool('ha', adapter)`.
+- **OpenClaw Gateway live verification.** With `HEARTH_OPENCLAW_URL=http://127.0.0.1:8443` (or wherever OpenClaw's gateway listens) and `HEARTH_GATEWAY_TOKEN=$(<"$HEARTH_SECRET_DIR/openclaw-gateway-token")`, the doctor should report `[OK] openclaw-reachable`. Loopback-only is enforced; non-loopback URLs are refused.
+- **Bonsai lock SHA-256 (item 7, complete the lock).** Run on the deployment host:
+  ```
+  shasum -a 256 "$HEARTH_MODEL_DIR/Bonsai-27B-Q1_0.gguf"
+  ```
+  Then patch the SHAs into `models/bonsai.lock.json` and `packages/openclaw-adapter/src/lock.ts`.
+
 ## 14. Stop the foreground services
 
 In each Terminal window running Bonsai, GLiNER2, Hearth control, or the PWA, press:
