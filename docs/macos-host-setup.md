@@ -446,30 +446,31 @@ For a new local installation on Apple Silicon, two routes are supported:
 This is the lightest path on macOS. No virtual machine, no extra kernel modules, no re-pairing of devices. Home Assistant runs as a Docker container on `127.0.0.1:8123` and Hearth reaches it over loopback.
 
 ```bash
-# Install Docker Desktop if it is not already present.
 brew install --cask docker
 open -a Docker
-# Wait for Docker to finish starting (the whale icon in the menu bar
-# stops animating). On Apple Silicon this takes 10-30 seconds.
+sleep 30
+```
 
-# Run Home Assistant Container on the host network so mDNS works and
-# the container sees the LAN. The first boot pulls the HA image and
-# writes an empty config under ~/ha-config/.
-docker run -d \
-  --name homeassistant \
-  --restart=unless-stopped \
-  --network=host \
-  -v ~/ha-config:/config \
-  -e TZ="$(systemsetup -gettimezone 2>/dev/null | awk -F': ' '{print $2}')" \
-  homeassistant/home-assistant:stable
+> If this is a fresh Docker install, the first launch shows the Docker
+> Subscription Service Agreement. Accept it (or the daemon never
+> starts). The whale icon in the menu bar stops animating when the
+> engine is ready.
 
-# Wait for HA to finish first boot. This can take 60-180 seconds.
-for i in $(seq 1 60); do
+```bash
+docker run -d --name homeassistant --restart=unless-stopped -p 8123:8123 -v ~/ha-config:/config -e TZ=America/Chicago homeassistant/home-assistant:stable
+
+# Apple Silicon Docker Desktop runs containers in a Linux VM under
+# the hood; --network=host does not behave like a real Linux host,
+# so we publish the port explicitly with -p 8123:8123 instead.
+```
+
+```bash
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
   if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8123 2>/dev/null; then
-    echo "Home Assistant reachable after ${i}*3s"
+    echo "Home Assistant reachable after ${i}*5s"
     break
   fi
-  sleep 3
+  sleep 5
 done
 ```
 
