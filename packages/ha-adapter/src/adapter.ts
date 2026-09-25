@@ -334,7 +334,7 @@ export class FakeHAAdapter implements HomeAssistantAdapter {
  * implementation would add 'ha' here and `setActive` would route between
  * them.
  */
-export type ProviderKey = 'fake';
+export type ProviderKey = 'fake' | 'ha';
 
 /**
  * Manages the set of registered HA providers and which one is currently
@@ -345,9 +345,15 @@ export class HAConnectionPool {
   private readonly adapters: Map<ProviderKey, HomeAssistantAdapter> = new Map();
   private active: ProviderKey = 'fake';
 
-  constructor(seed: FixtureSeed) {
+  constructor(seed: FixtureSeed);
+  constructor(seed: FixtureSeed, active: ProviderKey, adapter: HomeAssistantAdapter);
+  constructor(seed: FixtureSeed, active?: ProviderKey, adapter?: HomeAssistantAdapter) {
     const fake = new FakeHAAdapter(seed);
     this.adapters.set('fake', fake);
+    if (active && adapter) {
+      this.adapters.set(active, adapter);
+      this.active = active;
+    }
   }
 
   get activeProvider(): ProviderKey {

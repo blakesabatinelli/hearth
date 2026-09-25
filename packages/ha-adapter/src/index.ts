@@ -1,13 +1,14 @@
 /**
  * @hearth/ha-adapter
  *
- * Fake-HA adapter for Hearth. In-memory only: no network, no client
- * library, no credentials. Real HA is a future config switch, not a code
- * change (plan section 13 Stage 1 gate).
+ * Home Assistant adapter for Hearth. Two surfaces:
+ *   - FakeHAAdapter / HAConnectionPool / loadDefaultFixture: the
+ *     in-memory synthetic fixture used by tests and demo mode.
+ *   - LiveHAAdapter: the real Home Assistant REST + WebSocket adapter
+ *     for live deployment. Activated by HEARTH_FIXTURE_MODE=0 in
+ *     apps/control/src/main.ts.
  *
- * Exports the fake-HA adapter, a connection pool that wires only the fake
- * today, and the default synthetic household fixture used by tests and
- * demo mode.
+ * Both implement HomeAssistantAdapter from @hearth/contracts.
  */
 
 export {
@@ -17,3 +18,5 @@ export {
   type FixtureSeed,
   type ProviderKey,
 } from './adapter.js';
+
+export { LiveHAAdapter, type LiveHAOptions } from './live.js';

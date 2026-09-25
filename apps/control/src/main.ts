@@ -10,7 +10,14 @@
  *   HEARTH_HOST                  listen host (default 0.0.0.0)
  *   HEARTH_SESSION_SECRET        HMAC secret for session cookies (REQUIRED in prod)
  *   HEARTH_SQLITE_PATH           path to executor SQLite database (default :memory:)
- *   HEARTH_FIXTURE_MODE          if "1", use the in-memory fake-HA fixture (default 1)
+ *   HEARTH_FIXTURE_MODE          "1" (default, safe) or "0" for live HA. Setting
+ *                                "0" requires HEARTH_HA_URL and HEARTH_HA_TOKEN,
+ *                                else the service refuses to start (fail closed).
+ *   HEARTH_HA_URL                base URL of Home Assistant (live mode only).
+ *   HEARTH_HA_TOKEN              long-lived HA access token (live mode only).
+ *   HEARTH_EXTRACT_URL           base URL of the GLiNER2 sidecar. If set, the
+ *                                interpreter uses the HTTP provider; if unset,
+ *                                the bundled mock provider runs in fixture mode.
  */
 import {
   SystemClock,
@@ -19,6 +26,7 @@ import {
 } from '@hearth/executor';
 import {
   HAConnectionPool,
+  LiveHAAdapter,
   loadDefaultFixture,
 } from '@hearth/ha-adapter';
 import { RegistryOverlay } from '@hearth/registry';
@@ -39,6 +47,67 @@ async function makeStore(sqlite_path: string): Promise<ExecutionStore> {
   return new SqliteExecutionStore({ db });
 }
 
+/**
+ * Resolve which HA adapter to wire based on env. Returns the adapter
+ * and a tagged mode so the rest of main() can log and guard.
+ *
+ * Mode rules:
+ *   - HEARTH_FIXTURE_MODE unset or "1" -> fixture (default; safe).
+ *   - HEARTH_FIXTURE_MODE "0":
+ *     - HEARTH_HA_URL must be set, else fail closed.
+ *     - HEARTH_HA_TOKEN must be set, else fail closed.
+ *     - On success, instantiate LiveHAAdapter.
+ */
+async function resolveAdapter(): Promise<{
+  adapter: import('@hearth/contracts').HomeAssistantAdapter;
+  pool: import('@hearth/ha-adapter').HAConnectionPool;
+  registry: RegistryOverlay;
+  mode: 'fixture' | 'live';
+  ha_url?: string;
+}> {
+  const fixture_mode = (process.env.HEARTH_FIXTURE_MODE ?? '1') !== '0';
+
+  if (fixture_mode) {
+    const fixture = loadDefaultFixture();
+    const registry = new RegistryOverlay({
+      devices: fixture.devices,
+      rooms: fixture.rooms,
+      entity_version: 1,
+      scene_versions: {},
+    });
+    const pool = new HAConnectionPool(fixture);
+    return { adapter: pool.getActive(), pool, registry, mode: 'fixture' };
+  }
+
+  // Live mode path; fail closed if any required env is missing.
+  const ha_url = process.env.HEARTH_HA_URL ?? '';
+  const ha_token = process.env.HEARTH_HA_TOKEN ?? '';
+  if (!ha_url) {
+    throw new Error('HEARTH_FIXTURE_MODE=0 but HEARTH_HA_URL is not set; refusing to start');
+  }
+  if (!ha_token) {
+    throw new Error('HEARTH_FIXTURE_MODE=0 but HEARTH_HA_TOKEN is not set; refusing to start');
+  }
+
+  const live = new LiveHAAdapter({ base_url: ha_url, token: ha_token });
+  // Probe HA before binding; fail closed if the token is bad or HA is
+  // unreachable. The probe is a single /api/ call; no retries, no
+  // backoff; the operator should see the error immediately.
+  await live.probe();
+  const [devices, rooms] = await Promise.all([live.listDevices(), live.listRooms()]);
+  const registry = new RegistryOverlay({
+    devices: devices as never,
+    rooms: rooms as never,
+    entity_version: 1,
+    scene_versions: {},
+  });
+  // The pool still wires a fake adapter (so existing code paths that
+  // ask for it keep working); the live one is set as active.
+  const fixture = loadDefaultFixture();
+  const pool = new HAConnectionPool(fixture, 'ha', live);
+  return { adapter: pool.getActive(), pool, registry, mode: 'live', ha_url };
+}
+
 async function main(): Promise<void> {
   // Subcommand: `doctor` runs the diagnostic and exits.
   if (process.argv[2] === 'doctor') {
@@ -51,17 +120,15 @@ async function main(): Promise<void> {
   const host = process.env.HEARTH_HOST ?? '0.0.0.0';
   const session_secret = process.env.HEARTH_SESSION_SECRET ?? 'dev-secret-change-me';
   const sqlite_path = process.env.HEARTH_SQLITE_PATH ?? ':memory:';
+  const extract_url = process.env.HEARTH_EXTRACT_URL ?? '';
 
-  const fixture = loadDefaultFixture();
-  const registry = new RegistryOverlay({
-    devices: fixture.devices,
-    rooms: fixture.rooms,
-    entity_version: 1,
-    scene_versions: {},
-  });
-
-  const pool = new HAConnectionPool(fixture);
-  const adapter = pool.getActive();
+  // Resolve adapter (fixture or live). resolveAdapter() throws if
+  // live mode is requested without the required env, which we let
+  // propagate to the catch below so the operator sees a clean error.
+  const resolved = await resolveAdapter();
+  // eslint-disable-next-line no-console
+  console.log(`[hearth-control] adapter mode: ${resolved.mode}${resolved.ha_url ? ` (${resolved.ha_url})` : ''}`);
+  const { adapter, registry } = resolved;
 
   const store = await makeStore(sqlite_path);
   const clock = new SystemClock();
@@ -72,6 +139,7 @@ async function main(): Promise<void> {
     store,
     clock,
     session_secret,
+    ...(extract_url ? { gliner2_http_url: extract_url } : {}),
   });
 
   // Recovery: load interrupted contracts (dispatching / sent-unconfirmed)
@@ -215,6 +283,29 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
       checks.push({ name: lock, status: 'PASS', detail: 'present' });
     } else {
       checks.push({ name: lock, status: 'FAIL', detail: 'missing' });
+    }
+  }
+
+  // Check 6: Adapter mode. Fixture mode is the safe default; live mode
+  // requires both HEARTH_HA_URL and HEARTH_HA_TOKEN to be configured.
+  const fixture_mode = (process.env.HEARTH_FIXTURE_MODE ?? '1') !== '0';
+  if (fixture_mode) {
+    checks.push({ name: 'adapter-mode', status: 'PASS', detail: 'fixture (HEARTH_FIXTURE_MODE=1); live HA not required' });
+  } else {
+    const ha_url = process.env.HEARTH_HA_URL ?? '';
+    const ha_token = process.env.HEARTH_HA_TOKEN ?? '';
+    if (!ha_url || !ha_token) {
+      checks.push({
+        name: 'adapter-mode',
+        status: 'FAIL',
+        detail: 'HEARTH_FIXTURE_MODE=0 but HEARTH_HA_URL and HEARTH_HA_TOKEN must both be set',
+      });
+    } else {
+      checks.push({
+        name: 'adapter-mode',
+        status: 'PASS',
+        detail: `live (HEARTH_HA_URL=${ha_url})`,
+      });
     }
   }
 
