@@ -16,15 +16,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d4ee9c464c8a83f8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pnpm
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       - name: Setup Node
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '24'
           cache: pnpm
 
       - name: Install dependencies
@@ -47,7 +47,7 @@ jobs:
         run: node scripts/verify-portability.mjs
 
       - name: Secret scan via gitleaks
-        uses: gitleaks/gitleaks-action@9b32f84186b4a8fcb38da27c7b8eb3f2f3c2c0fb
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -57,7 +57,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d4ee9c464c8a83f8
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify no JWT-shaped strings in source
         run: |
           set -e
@@ -68,13 +68,13 @@ jobs:
             echo '::error::Found JWT-shaped string in source - may be a HA token. Verify and remove if so.'
             exit 1
           fi
-      - name: Verify no private IPs in source
+      - name: Verify no private RFC1918 addresses in source
         run: |
           set -e
-          if grep -rE '\b(10|192\.168|127)\.[0-9]+\.[0-9]+\.[0-9]+\b' \
+          if grep -rE '\b10\.[0-9]+\.[0-9]+\.[0-9]+\b|\b192\.168\.[0-9]+\.[0-9]+\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+\b' \
              --include='*.ts' --include='*.mjs' --include='*.json' --include='*.yaml' --include='*.yml' \
              --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
              . ; then
-            echo '::error::Found private IP. Use 0.0.0.0 in docs and config templates, real hostnames in installation-local config.'
+            echo '::error::Found an RFC1918 address. Use documentation-safe placeholders in templates and installation-local addresses in runtime config.'
             exit 1
           fi
