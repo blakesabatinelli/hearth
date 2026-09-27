@@ -1,6 +1,6 @@
-# gitleaks config — reject secrets, tokens, keys, and dev-machine leakage.
+# Gitleaks config - reject secrets, tokens, and keys.
 # Plan section 11 (no home paths, no dev tokens, no shell history in
-# source/artifacts) + section 12 (secret scanning on every change).
+# source/artifacts) is enforced by scripts/verify-portability.mjs.
 title = "hearth gitleaks"
 
 [[rules]]
@@ -44,12 +44,6 @@ id = "private-key-block"
 description = "PEM private key block"
 regex = '''-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'''
 tags = ["secret"]
-
-[[rules]]
-id = "macos-users-path"
-description = "Committed macOS home path outside the workdir"
-regex = '''/Users/(?!blake\.sabatinelli/Desktop/hearth)'''
-tags = ["portability"]
 
 [[rules]]
 id = "home-assistant-token"

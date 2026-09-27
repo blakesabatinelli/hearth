@@ -27,12 +27,12 @@
     "@hearth/openclaw-adapter": "workspace:*",
     "@hearth/registry": "workspace:*",
     "@hearth/scheduler": "workspace:*",
+    "better-sqlite3": "13.0.3",
     "fastify": "5.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.12",
     "@types/node": "22.10.5",
-    "better-sqlite3": "11.7.0",
     "typescript": "5.6.3",
     "vitest": "2.1.9"
   }

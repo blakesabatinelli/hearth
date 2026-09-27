@@ -562,6 +562,13 @@ function alreadySatisfied(
   return true;
 }
 
+function hasObservedValues(
+  obs: StateObservation,
+  desired: Readonly<Record<string, number | string | boolean>>,
+): boolean {
+  return Object.keys(desired).every((key) => obs.values[key] !== undefined);
+}
+
 function freshEnough(obs: StateObservation, ms: number, now: Date): boolean {
   if (ms <= 0) return true;
   const t = Date.parse(obs.observed_at);
@@ -708,42 +715,36 @@ export class ContractExecutor {
 
         // Watcher resolves with a fresh observation that matches the goal.
         // Stays open across dispatch so a fast state event is not missed.
+        let observedValue: StateObservation | null = null;
         const observed = new Promise<StateObservation | null>((resolve) => {
           let settled = false;
           const handler: StateHandler = (obs: StateObservation) => {
             if (settled) return;
             if (!freshEnough(obs, policy.require_fresh_observation_ms, this.clock.now())) return;
+            if (!alreadySatisfied(obs, desired)) return;
             settled = true;
+            observedValue = obs;
             resolve(obs);
           };
           const sub = this.adapter.subscribe([target.canonical_id], handler);
           subs.push(sub);
-          // Initial getState doubles as the already-satisfied fast path.
-          this.adapter
-            .getState(target.canonical_id)
-            .then((obs: StateObservation) => {
-              if (settled) return;
-              if (!freshEnough(obs, policy.require_fresh_observation_ms, this.clock.now())) return;
-              if (alreadySatisfied(obs, desired)) {
-                settled = true;
-                resolve(obs);
-              }
-            })
-            .catch(() => {
-              /* swallowed; recovery handles it */
-            });
         });
 
-        // Already-satisfied fast path: check if the initial getState
-        // settled the promise (non-blocking).
-        const early = await Promise.race([
-          observed,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
-        ]);
-        if (early && alreadySatisfied(early, desired)) {
+        // Await the fresh poll instead of racing it against a zero-delay timer.
+        // A live adapter can take longer than one event-loop turn; dispatching
+        // before that read completes turns an already-satisfied command into
+        // an unconfirmed provider call.
+        const initial = await this.adapter.getState(target.canonical_id).catch(() => null);
+        const already_satisfied = [initial, observedValue].find(
+          (obs): obs is StateObservation =>
+            obs !== null &&
+            freshEnough(obs, policy.require_fresh_observation_ms, this.clock.now()) &&
+            alreadySatisfied(obs, desired),
+        );
+        if (already_satisfied) {
           per_target[target.canonical_id] = {
             kind: 'already-satisfied',
-            observed_at: early.observed_at,
+            observed_at: already_satisfied.observed_at,
           };
           continue;
         }
@@ -778,26 +779,57 @@ export class ContractExecutor {
           continue;
         }
 
-        // Wait for a fresh observation up to a short bounded window. The
-        // adapter controls real timing; we give the watcher a chance to
-        // deliver before falling back.
-        const observedAfter = await Promise.race([
-          observed,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
-        ]);
-
-        if (
-          observedAfter &&
-          freshEnough(observedAfter, policy.require_fresh_observation_ms, this.clock.now())
-        ) {
-          if (alreadySatisfied(observedAfter, desired)) {
-            per_target[target.canonical_id] = {
-              kind: 'observed-after-command',
-              observed_at: observedAfter.observed_at,
-              state_version: observedAfter.state_version,
-            };
-            continue;
+        // Watch for the expected state event and poll HA for a bounded
+        // confirmation window. Some integrations update asynchronously and
+        // may not emit a WebSocket event promptly.
+        const confirmation_timeout_ms = Math.max(
+          100,
+          Math.min(policy.require_fresh_observation_ms, 5_000),
+        );
+        const confirmation_deadline = Date.now() + confirmation_timeout_ms;
+        let observedAfter: StateObservation | null = null;
+        let lastKnownObservation = initial;
+        while (Date.now() <= confirmation_deadline) {
+          const eventObservation = await Promise.race([
+            observed,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
+          ]);
+          if (eventObservation) {
+            observedAfter = eventObservation;
+            break;
           }
+
+          const polled = await this.adapter.getState(target.canonical_id).catch(() => null);
+          if (polled) {
+            lastKnownObservation = polled;
+            if (
+              freshEnough(polled, policy.require_fresh_observation_ms, this.clock.now()) &&
+              alreadySatisfied(polled, desired)
+            ) {
+              observedAfter = polled;
+              break;
+            }
+          }
+
+          const remaining = confirmation_deadline - Date.now();
+          if (remaining <= 0) break;
+          const nextEvent = await Promise.race([
+            observed,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(100, remaining))),
+          ]);
+          if (nextEvent) {
+            observedAfter = nextEvent;
+            break;
+          }
+        }
+
+        if (observedAfter) {
+          per_target[target.canonical_id] = {
+            kind: 'observed-after-command',
+            observed_at: observedAfter.observed_at,
+            state_version: observedAfter.state_version,
+          };
+          continue;
         }
 
         // No fresh observation: classify by policy.
@@ -808,12 +840,14 @@ export class ContractExecutor {
           };
         } else {
           per_target[target.canonical_id] = {
-            kind: 'failed',
-            error: {
-              code: 'provider-error',
-              provider: 'ha',
-              message: 'sent-unconfirmed and accept_optimistic=false',
-            },
+            kind: 'unknown-after-failure',
+            last_known_state: lastKnownObservation
+              ? {
+                  observed_at: lastKnownObservation.observed_at,
+                  source: lastKnownObservation.source,
+                  values: lastKnownObservation.values,
+                }
+              : null,
           };
         }
       }
@@ -875,7 +909,10 @@ export class ContractExecutor {
    *   - past expiry_at -> mark expired (no provider call)
    *   - superseded -> leave alone; supersede happens elsewhere
    *   - a fresh trustworthy observation that matches the goal -> mark no-op
-   *   - otherwise retry once under bounded policy via dispatch()
+   *   - a fresh observation that does not match the goal -> retry the
+   *     idempotent set-state once under the normal dispatch policy
+   *   - stale or unavailable observation -> keep the outcome uncertain and
+   *     never replay without evidence
    */
   public async reconcileOnStartup(): Promise<ReadonlyArray<Receipt>> {
     const interrupted = this.store.findContractsByStatus(['dispatching', 'sent-unconfirmed']);
@@ -896,20 +933,29 @@ export class ContractExecutor {
       }
 
       let anyNeededDispatch = false;
+      let observationUncertain = false;
       const per_target: Record<string, TargetOutcome> = {};
       for (const target of contract.targets) {
         try {
           const obs = await this.adapter.getState(target.canonical_id);
           const policy = contract.per_target_evidence[target.canonical_id] ?? EVIDENCE_DEFAULT;
-          if (freshEnough(obs, policy.require_fresh_observation_ms, this.clock.now())) {
-            if (alreadySatisfied(obs, contract.desired_values)) {
-              per_target[target.canonical_id] = {
-                kind: 'observed-after-command',
-                observed_at: obs.observed_at,
-                state_version: obs.state_version,
-              };
-              continue;
-            }
+          if (!freshEnough(obs, policy.require_fresh_observation_ms, this.clock.now())
+            || !hasObservedValues(obs, contract.desired_values)) {
+            anyNeededDispatch = true;
+            observationUncertain = true;
+            per_target[target.canonical_id] = {
+              kind: 'unknown-after-failure',
+              last_known_state: obs.values,
+            };
+            continue;
+          }
+          if (alreadySatisfied(obs, contract.desired_values)) {
+            per_target[target.canonical_id] = {
+              kind: 'observed-after-command',
+              observed_at: obs.observed_at,
+              state_version: obs.state_version,
+            };
+            continue;
           }
           anyNeededDispatch = true;
           per_target[target.canonical_id] = {
@@ -918,6 +964,11 @@ export class ContractExecutor {
           };
         } catch {
           anyNeededDispatch = true;
+          observationUncertain = true;
+          per_target[target.canonical_id] = {
+            kind: 'unknown-after-failure',
+            last_known_state: null,
+          };
         }
       }
 
@@ -935,7 +986,23 @@ export class ContractExecutor {
         continue;
       }
 
-      // Retry once: re-dispatch; idempotency + status checks run again.
+      if (observationUncertain) {
+        this.store.updateStatus(contract.contract_id, 'sent-unconfirmed');
+        const r = buildReceipt({
+          contract_id: contract.contract_id,
+          actor: contract.actor,
+          per_target,
+          created_at: this.clock.nowIso(),
+          aggregate: 'sent-unconfirmed',
+        });
+        this.store.saveReceipt(r);
+        out.push(r);
+        continue;
+      }
+
+      // A fresh mismatch is evidence that the goal is still absent. Retry the
+      // idempotent state-setting command once; stale or missing evidence above
+      // has already taken the uncertain no-replay path.
       try {
         const fresh = await this.dispatch(contract);
         out.push(fresh);

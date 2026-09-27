@@ -6,8 +6,8 @@
  *
  * Surfaces:
  *   - REST: GET /api/states, GET /api/states/<entity_id>,
- *           GET /api/areas, POST /api/services/<domain>/<service>
- *   - WebSocket: /api/websocket for state_changed events (subscribe)
+ *           POST /api/services/<domain>/<service>
+ *   - WebSocket: registries and state_changed events via /api/websocket
  *
  * Notes:
  *   - Plan section 8: a state-changed event that arrives BEFORE the
@@ -43,6 +43,10 @@ export type LiveHAOptions = {
    * Optional fetch override for tests; defaults to global fetch.
    */
   readonly fetch_impl?: typeof fetch;
+  /** Exact HA entity IDs approved for executor dispatch. Empty by default. */
+  readonly actuation_allowlist?: ReadonlySet<string>;
+  /** Optional WebSocket override for Home Assistant registry discovery tests. */
+  readonly websocket_factory?: (url: string) => WebSocket;
 };
 
 type HARawState = {
@@ -56,6 +60,30 @@ type HARawState = {
 type HARawArea = {
   area_id: string;
   name: string;
+};
+
+type HARawEntityRegistryEntry = {
+  entity_id: string;
+  area_id: string | null;
+  device_id?: string | null;
+  unique_id?: string;
+  platform?: string;
+  entity_category?: string | null;
+};
+
+type HARawDeviceRegistryEntry = {
+  id: string;
+  area_id: string | null;
+  name?: string | null;
+  name_by_user?: string | null;
+  manufacturer?: string | null;
+  model?: string | null;
+};
+
+type HARegistrySnapshot = {
+  readonly areas: HARawArea[];
+  readonly entities: HARawEntityRegistryEntry[];
+  readonly devices: HARawDeviceRegistryEntry[];
 };
 
 type Subscription = {
@@ -91,6 +119,16 @@ const HA_DOMAIN_TO_SERVICE: Readonly<Record<string, string>> = {
   climate: 'set_temperature',
   lock: 'lock',
 };
+
+function sameStateValues(
+  left: Readonly<Record<string, number | string | boolean>>,
+  right: Readonly<Record<string, number | string | boolean>>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && left[key] === right[key]);
+}
 
 /**
  * Synthesize a canonical_id from an HA entity_id. The convention is
@@ -131,6 +169,8 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
   private readonly base_url: string;
   private readonly token: string;
   private readonly fetch_impl: typeof fetch;
+  private readonly actuation_allowlist: ReadonlySet<string>;
+  private readonly websocket_factory: (url: string) => WebSocket;
   private readonly subs: Set<Subscription> = new Set();
   private ws: WebSocket | null = null;
   private ws_reconnect_attempt = 0;
@@ -140,11 +180,14 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
   private readonly last_values: Map<CanonicalId, Readonly<Record<string, number | string | boolean>>> = new Map();
   private readonly area_cache: Map<string, HARawArea> = new Map();
   private readonly entity_to_area: Map<string, string> = new Map();
+  private readonly entity_metadata: Map<string, Omit<Extract<ProviderId, { kind: 'ha' }>, 'kind' | 'entity_id'>> = new Map();
 
   constructor(opts: LiveHAOptions) {
     this.base_url = opts.base_url.replace(/\/+$/, '');
     this.token = opts.token;
     this.fetch_impl = opts.fetch_impl ?? fetch;
+    this.actuation_allowlist = opts.actuation_allowlist ?? new Set();
+    this.websocket_factory = opts.websocket_factory ?? ((url) => new WebSocket(url));
   }
 
   /**
@@ -173,14 +216,11 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
   }
 
   async listDevices(): Promise<ReadonlyArray<DeviceRecord>> {
-    const [states, areas] = await Promise.all([
+    const [states, registry] = await Promise.all([
       this.fetch_states(),
-      this.fetch_areas(),
+      this.fetch_registry_snapshot().catch(() => null),
     ]);
-
-    // Build entity_id -> area_id from /api/areas + the registry.
-    // If registry endpoint is unavailable we leave area unmapped.
-    await this.fetch_entity_registry();
+    this.apply_registry_snapshot(registry);
 
     const devices: DeviceRecord[] = [];
     for (const s of states) {
@@ -196,7 +236,12 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
 
       const caps = inferCapabilities(s.entity_id, s.attributes);
       const area_id = this.entity_to_area.get(s.entity_id);
-      const provider_id: ProviderId = { kind: 'ha', entity_id: s.entity_id };
+      const metadata = this.entity_metadata.get(s.entity_id);
+      const provider_id: ProviderId = {
+        kind: 'ha',
+        entity_id: s.entity_id,
+        ...(metadata ?? {}),
+      };
 
       const canonical_id = canonicalFromEntity(s.entity_id);
       devices.push({
@@ -207,23 +252,20 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
         aliases: [s.entity_id, friendly_name].filter((a, i, arr) => arr.indexOf(a) === i),
         provider_ids: [provider_id],
         room_id: area_id ? roomIdFromHA(area_id) : null,
-        allowed_actors: ['admin', 'member', 'wall-tablet'] as const,
+        allowed_actors: this.actuation_allowlist.has(s.entity_id)
+          ? ['admin', 'member', 'wall-tablet'] as const
+          : [],
         route_preference: 'ha-only',
         version: 1,
       });
-    }
-
-    // Cache areas for listRooms().
-    for (const a of areas) {
-      this.area_cache.set(a.area_id, a);
     }
 
     return devices;
   }
 
   async listRooms(): Promise<ReadonlyArray<Room>> {
-    await this.fetch_areas();
-    await this.fetch_entity_registry();
+    const registry = await this.fetch_registry_snapshot().catch(() => null);
+    this.apply_registry_snapshot(registry);
     const room_entity: Map<string, Set<CanonicalId>> = new Map();
     const states = await this.fetch_states();
     for (const s of states) {
@@ -365,13 +407,22 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
       const [r, g, b] = rgb_color as [number, number, number];
       values['color_rgb'] = `#${[r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('')}`;
     }
-    const observed_at = s.last_updated || s.last_changed || new Date().toISOString();
-    const prev = this.state_versions.get(canonicalFromEntity(s.entity_id)) ?? 1;
-    // Increment version on every fresh observation. The cache is local;
-    // real HA has no notion of an externally tracked state_version.
-    const state_version = prev + 1;
+    // This timestamp describes when Hearth observed the state, not when HA
+    // last saw a state change. An unchanged state is still freshly observed
+    // by this REST poll and can satisfy an idempotent command safely.
+    const observed_at = new Date().toISOString();
+    const canonical_id = canonicalFromEntity(s.entity_id);
+    const previous_values = this.last_values.get(canonical_id);
+    const previous_version = this.state_versions.get(canonical_id) ?? 1;
+    // Fresh polls alone do not make a contract stale. Advance the local
+    // version only when a target's command-relevant state actually changed.
+    const state_version = previous_values === undefined
+      ? previous_version
+      : sameStateValues(previous_values, values)
+        ? previous_version
+        : previous_version + 1;
     return {
-      canonical_id: canonicalFromEntity(s.entity_id),
+      canonical_id,
       observed_at,
       source: 'fresh-poll',
       values,
@@ -429,38 +480,119 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
     return (await res.json()) as HARawState[];
   }
 
-  private async fetch_areas(): Promise<ReadonlyArray<HARawArea>> {
-    const res = await this.fetch_impl(`${this.base_url}/api/areas`, {
-      headers: this.auth_headers(),
-    });
-    if (!res.ok) {
-      // Areas endpoint was added in 2024.x; older HA returns 404. We
-      // tolerate that and return an empty list.
-      return [];
+  private apply_registry_snapshot(snapshot: HARegistrySnapshot | null): void {
+    if (!snapshot) return;
+    this.area_cache.clear();
+    this.entity_to_area.clear();
+    this.entity_metadata.clear();
+    for (const area of snapshot.areas) this.area_cache.set(area.area_id, area);
+    const devices = new Map(snapshot.devices.map((device) => [device.id, device]));
+    for (const entity of snapshot.entities) {
+      if (entity.area_id) this.entity_to_area.set(entity.entity_id, entity.area_id);
+      const device = entity.device_id ? devices.get(entity.device_id) : undefined;
+      this.entity_metadata.set(entity.entity_id, {
+        ...(entity.device_id ? { device_id: entity.device_id } : {}),
+        ...(entity.unique_id ? { unique_id: entity.unique_id } : {}),
+        ...(entity.platform ? { platform: entity.platform } : {}),
+        ...(entity.entity_category !== undefined ? { entity_category: entity.entity_category } : {}),
+        ...(device ? {
+          device_name: device.name_by_user ?? device.name ?? null,
+          manufacturer: device.manufacturer ?? null,
+          model: device.model ?? null,
+        } : {}),
+      });
     }
-    const areas = (await res.json()) as HARawArea[];
-    for (const a of areas) {
-      this.area_cache.set(a.area_id, a);
+    for (const device of snapshot.devices) {
+      if (!device.area_id) continue;
+      for (const entity of snapshot.entities) {
+        if (entity.device_id === device.id && !entity.area_id) this.entity_to_area.set(entity.entity_id, device.area_id);
+      }
     }
-    return areas;
   }
 
-  private async fetch_entity_registry(): Promise<void> {
-    // /api/registry gives us the entity_id -> area_id mapping.
-    try {
-      const res = await this.fetch_impl(`${this.base_url}/api/registry`, {
-        headers: this.auth_headers(),
-      });
-      if (!res.ok) return;
-      const body = (await res.json()) as {
-        entities?: Array<{ entity_id: string; area_id: string | null }>;
+  /** Read Home Assistant's area, device, and entity registries over its authenticated WebSocket API. */
+  private async fetch_registry_snapshot(): Promise<HARegistrySnapshot> {
+    const socket_url = this.base_url.replace(/^http/, 'ws') + '/api/websocket';
+    const socket = this.websocket_factory(socket_url);
+    const commands = [
+      'config/area_registry/list',
+      'config/device_registry/list',
+      'config/entity_registry/list',
+    ] as const;
+    return await new Promise<HARegistrySnapshot>((resolve, reject) => {
+      let settled = false;
+      let authenticated = false;
+      let next_id = 1;
+      const pending = new Map<number, typeof commands[number]>();
+      const results = new Map<typeof commands[number], unknown>();
+      const timer = setTimeout(() => finish(new Error('Home Assistant registry WebSocket timed out')), 8_000);
+      const finish = (error?: Error, snapshot?: HARegistrySnapshot): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { socket.close(); } catch { /* ignore close errors */ }
+        if (error) reject(error);
+        else if (snapshot) resolve(snapshot);
+        else reject(new Error('Home Assistant registry response was empty'));
       };
-      for (const e of body.entities ?? []) {
-        if (e.area_id) this.entity_to_area.set(e.entity_id, e.area_id);
-      }
-    } catch {
-      // Registry is optional; older HA versions omit it.
-    }
+      const send_commands = (): void => {
+        if (authenticated) return;
+        authenticated = true;
+        for (const command of commands) {
+          const id = next_id++;
+          pending.set(id, command);
+          socket.send(JSON.stringify({ id, type: command }));
+        }
+      };
+      socket.addEventListener('message', (event) => {
+        let message: Record<string, unknown>;
+        try {
+          const raw = typeof event.data === 'string' ? event.data : String(event.data);
+          message = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          finish(new Error('Home Assistant sent an invalid registry WebSocket message'));
+          return;
+        }
+        if (message['type'] === 'auth_required') {
+          socket.send(JSON.stringify({ type: 'auth', access_token: this.token }));
+          return;
+        }
+        if (message['type'] === 'auth_invalid') {
+          finish(new Error('Home Assistant rejected WebSocket authentication'));
+          return;
+        }
+        if (message['type'] === 'auth_ok') {
+          send_commands();
+          return;
+        }
+        if (message['type'] !== 'result' || typeof message['id'] !== 'number') return;
+        const command = pending.get(message['id']);
+        if (!command) return;
+        pending.delete(message['id']);
+        if (message['success'] !== true) {
+          finish(new Error(`Home Assistant registry command failed: ${command}`));
+          return;
+        }
+        results.set(command, message['result']);
+        if (results.size !== commands.length) return;
+        const areas = results.get('config/area_registry/list');
+        const devices = results.get('config/device_registry/list');
+        const entities = results.get('config/entity_registry/list');
+        if (!Array.isArray(areas) || !Array.isArray(devices) || !Array.isArray(entities)) {
+          finish(new Error('Home Assistant returned malformed registry data'));
+          return;
+        }
+        finish(undefined, {
+          areas: areas as HARawArea[],
+          devices: devices as HARegistrySnapshot['devices'],
+          entities: entities as HARegistrySnapshot['entities'],
+        });
+      });
+      socket.addEventListener('error', () => finish(new Error('Home Assistant registry WebSocket failed')));
+      socket.addEventListener('close', () => {
+        if (!settled) finish(new Error('Home Assistant registry WebSocket closed early'));
+      });
+    });
   }
 
   private async ensureWebSocket(): Promise<void> {
@@ -473,7 +605,7 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
   private openWebSocket(): void {
     const ws_url = this.base_url.replace(/^http/, 'ws') + '/api/websocket';
     try {
-      this.ws = new WebSocket(ws_url);
+      this.ws = this.websocket_factory(ws_url);
     } catch (err) {
       // Browser/node WebSocket constructor can throw on bad URLs.
       this.ws_should_run = false;
@@ -506,6 +638,15 @@ export class LiveHAAdapter implements HomeAssistantAdapter {
     try {
       msg = JSON.parse(raw) as typeof msg;
     } catch {
+      return;
+    }
+    if (msg.type === 'auth_ok') {
+      this.ws?.send(JSON.stringify({ id: 1, type: 'subscribe_events', event_type: 'state_changed' }));
+      return;
+    }
+    if (msg.type === 'auth_invalid') {
+      this.ws_should_run = false;
+      try { this.ws?.close(); } catch { /* ignore close errors */ }
       return;
     }
     if (msg.type !== 'event' || !msg.event?.entity_id || !msg.event?.new_state) return;

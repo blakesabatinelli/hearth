@@ -6,22 +6,15 @@ This runbook targets an Apple Silicon Mac and the Hearth source tree. It install
 - OpenClaw 2026.9.6 configured to use that local Bonsai server.
 - The Hearth GLiNER2 sidecar with the pinned GLiNER2 2.0.0 package.
 - Home Assistant OS in a local virtual machine, or an existing Home Assistant instance.
-- The current Hearth control API and PWA in fixture mode.
+- The current Hearth control API and PWA in live Home Assistant mode.
 
-## Important current limitation
+## Current setup status
 
-The commands below bring all four external components up and verify each one independently. They do not make this revision of Hearth use all four components end to end.
-
-The current source has these blockers:
-
-1. `apps/control/src/main.ts` always constructs `HAConnectionPool` with the synthetic fixture. `HEARTH_HA_URL`, `HEARTH_HA_TOKEN`, and `HEARTH_FIXTURE_MODE` are not read during normal startup.
-2. `apps/control/src/main.ts` does not pass `HEARTH_EXTRACT_URL` to `wireControl()`. The variable is read only by the `doctor` subcommand.
-3. No real `BonsaiProvider` implementation exists. `wireControl()` defaults Bonsai to `null`.
-4. `packages/openclaw-adapter/` does not exist. Hearth cannot yet call the OpenClaw Gateway.
-5. `models/bonsai.lock.json` still has `TBD` artifact and runtime fields.
-6. The GLiNER2 `/extract` implementation has not been proven against the pinned package in a live environment.
-
-Do not claim a complete Hearth integration until those six items are implemented and the Stage 0 and Stage 3 gates pass. The final section lists the required code work.
+Updated 2026-09-27. Hearth, OpenClaw, Bonsai, GLiNER2, and Home Assistant run
+locally. Four Hearth user LaunchAgents now manage Bonsai, GLiNER2, control, and
+the production PWA. The current Home Assistant instance exposes 56 discovered
+records; only two previously verified bedroom lamps are enabled for live
+actuation. The Hue room group stays excluded.
 
 ## 1. Download the Hearth source code
 
@@ -216,7 +209,7 @@ llama-server \
   --alias bonsai-27b-q1 \
   --host 127.0.0.1 \
   --port 8080 \
-  --ctx-size 4096 \
+  --ctx-size 16384 \
   --n-gpu-layers 99 \
   --parallel 1 \
   --reasoning-budget 256
@@ -289,6 +282,14 @@ export OPENCLAW_GATEWAY_TOKEN="$(< "$HEARTH_SECRET_DIR/openclaw-gateway-token")"
 echo "Wrote gateway token to $HEARTH_SECRET_DIR/openclaw-gateway-token (umask 077, 600)"
 ```
 
+The OpenClaw LaunchAgent resolves this token reference from the macOS
+user launchd environment. Set it there before installing or starting the
+service. Repeat this command after logging out or restarting the Mac.
+
+```bash
+launchctl setenv OPENCLAW_GATEWAY_TOKEN "$(< "$HEARTH_SECRET_DIR/openclaw-gateway-token")"
+```
+
 Configure OpenClaw to use the already-running Bonsai server:
 
 ```bash
@@ -296,7 +297,8 @@ openclaw onboard \
   --non-interactive \
   --accept-risk \
   --mode local \
-  --auth-choice llama-cpp-existing-server \
+  --auth-choice custom-api-key \
+  --custom-provider-id bonsai-local \
   --custom-base-url http://127.0.0.1:8080/v1 \
   --custom-model-id bonsai-27b-q1 \
   --custom-text-input \
@@ -313,6 +315,17 @@ openclaw onboard \
   --skip-ui
 ```
 
+OpenClaw 2026.9.6 does not accept `llama-cpp-existing-server` as an
+`--auth-choice`; the custom OpenAI-compatible provider options above
+configure the local llama-server endpoint. Restrict the agent tools and
+match OpenClaw's model context to the server:
+
+```bash
+openclaw config set tools.profile minimal
+openclaw config set models.providers.bonsai-local.models.0.contextWindow 16384 --strict-json
+openclaw config set models.providers.bonsai-local.models.0.maxTokens 512 --strict-json
+```
+
 Verify OpenClaw:
 
 ```bash
@@ -327,6 +340,8 @@ Run one local model turn:
 ```bash
 openclaw agent \
   --agent main \
+  --thinking off \
+  --timeout 240 \
   --message 'Reply with exactly: BONSAI_OK'
 ```
 
@@ -425,7 +440,7 @@ curl -fsS http://127.0.0.1:8770/extract \
     "utterance": "turn off the kitchen lights",
     "schema": {
       "schema_version": "0.0.1",
-      "entity_types": ["device_target", "room_target"],
+      "entity_types": ["device_target", "room"],
       "classification_labels": ["on", "off"],
       "relations": [],
       "known_aliases": []
@@ -434,6 +449,45 @@ curl -fsS http://127.0.0.1:8770/extract \
 ```
 
 Do not treat `/health` alone as proof. The `/extract` request must return HTTP 200 and a body containing the same `request_id` and `original_utterance`. If it returns HTTP 500, the sidecar's GLiNER2 2.0.0 API call needs to be corrected before Hearth can use it.
+
+## 9a. Fine-tune GLiNER2 locally
+
+Hearth's pilot trainer uses LoRA and keeps household names and example
+utterances under the local Application Support directory. It does not upload
+training data. Set the room and exact approved device names from Home Assistant:
+
+```bash
+export HEARTH_RUNTIME_ROOT="$HOME/Library/Application Support/Hearth"
+export HEARTH_GLINER2_DATA="$HEARTH_RUNTIME_ROOT/models/gliner2/pilot-data"
+export HEARTH_PILOT_ROOM='room name from Home Assistant'
+export HEARTH_PILOT_DEVICE_ONE='first approved light name'
+export HEARTH_PILOT_DEVICE_TWO='second approved light name'
+
+apps/extract/.venv/bin/python scripts/generate-gliner2-pilot-data.py \
+  --room "$HEARTH_PILOT_ROOM" \
+  --device "$HEARTH_PILOT_DEVICE_ONE" \
+  --device "$HEARTH_PILOT_DEVICE_TWO" \
+  --output-dir "$HEARTH_GLINER2_DATA"
+
+export HEARTH_GLINER2_MODEL_OUT="$HEARTH_RUNTIME_ROOT/models/gliner2/hearth-pilot"
+TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4 \
+  apps/extract/.venv/bin/python scripts/train-gliner2-local.py \
+  --base-model fastino/gliner2.5-base-v1 \
+  --train-jsonl "$HEARTH_GLINER2_DATA/train.jsonl" \
+  --eval-jsonl "$HEARTH_GLINER2_DATA/eval.jsonl" \
+  --output-dir "$HEARTH_GLINER2_MODEL_OUT"
+
+apps/extract/.venv/bin/python scripts/evaluate-gliner2-pilot.py \
+  --checkpoint "$HEARTH_GLINER2_MODEL_OUT/merged" \
+  --eval-jsonl "$HEARTH_GLINER2_DATA/eval.jsonl" \
+  --report "$HEARTH_GLINER2_MODEL_OUT/pilot-evaluation.json"
+```
+
+The trainer needs a cached pinned base checkpoint and merges the learned
+adapter into `merged/` for direct sidecar loading. Treat the small pilot score
+as a local diagnostic. The separate frozen Stage 3 suite is in
+`eval/commands/stage3-corpus.jsonl`; see `docs/gates.md` for passing report
+commands and current results.
 
 ## 10. Install Home Assistant OS
 
@@ -621,11 +675,24 @@ curl -fsS "$HEARTH_HA_URL/api/states" \
   | sort
 ```
 
-Do not send service calls during setup. Device actuation remains fixture-only until Hearth has a real adapter, an imported registry, a reviewed allowlist, and evidence policies.
+This probe only verifies Home Assistant access. Hearth's live adapter imports
+entities for discovery. Physical dispatch stays behind the executor and is
+limited to the exact IDs in `HEARTH_HA_ACTUATION_ALLOWLIST`. The two approved
+pilot devices currently use the active SmartThings entities
+`light.fixture_room_lamp_alpha` and
+`light.fixture_room_lamp_beta`. The similarly named Hue entities are
+disabled in Home Assistant. Do not add the Hue room group or other imported
+devices without separate review and authorization.
 
-## 12. Start the current Hearth application
+## 12. Start Hearth
 
-The current application starts only with the synthetic Home Assistant fixture and mock GLiNER2 provider. This is useful for verifying the checked-in code, but it is not the live integration.
+Fixture mode is the default. For live discovery, configure the HA URL and token
+and set `HEARTH_FIXTURE_MODE=0`. The approved pilot allowlist is restricted to
+the two individual master-bedroom lamp entity IDs listed above. The local PWA uses an admin session when the
+control service is bound to loopback and started with `HEARTH_ALLOW_DEV_ADMIN=1`.
+The `Run with Hearth` button is the user's action request; an eligible proposal
+with a server receipt goes straight to the executor without an extra browser
+confirmation. The executor still rejects entities outside the exact allowlist.
 
 Create a session secret and database location. The same `$HEARTH_SECRET_DIR`
 guard applies:
@@ -643,6 +710,15 @@ export HEARTH_EXTRACT_URL=http://127.0.0.1:8770
 echo "Wrote session secret to $HEARTH_SECRET_DIR/hearth-session-secret (600)"
 ```
 
+`HEARTH_SQLITE_PATH` stores executor records and saved routine/hold schedules
+in the same SQLite database. Keep this file under the installation-local data
+directory so routines survive a control-service restart. Routines created in
+the PWA store their selected IANA time zone; older records without a time zone
+use UTC. Hearth runs only the occurrence due in the current minute; offline
+occurrences are skipped. A pending fire left by a crash is marked skipped
+during recovery because Hearth cannot know whether the prior process sent its
+device command. It is never blindly replayed.
+
 Open another Terminal window and start the control API. If you
 persisted the HEARTH_*_DIR lines to ~/.zshenv, the directory exports
 below are redundant; they are written here for clarity when running
@@ -659,15 +735,23 @@ export HEARTH_SQLITE_PATH="$HEARTH_DATA_DIR/hearth.sqlite"
 export HEARTH_HOST=127.0.0.1
 export HEARTH_PORT=8787
 export HEARTH_EXTRACT_URL=http://127.0.0.1:8770
+export HEARTH_GLINER2_CHECKPOINT="$HEARTH_RUNTIME_ROOT/models/gliner2/hearth-pilot-20260925-v5/merged"
+export HEARTH_FIXTURE_MODE=0
+export HEARTH_HA_URL=http://127.0.0.1:8123
+export HEARTH_HA_TOKEN="$(< "$HEARTH_SECRET_DIR/home-assistant-token")"
+export HEARTH_OPENCLAW_URL=http://127.0.0.1:18789
+export HEARTH_GATEWAY_TOKEN="$(< "$HEARTH_SECRET_DIR/openclaw-gateway-token")"
+export HEARTH_HA_ACTUATION_ALLOWLIST="$(< "$HEARTH_SECRET_DIR/hearth-actuation-allowlist")"
+export HEARTH_ALLOW_DEV_ADMIN=1
 node apps/control/dist/src/main.js
 ```
 
-Open another Terminal window and start the PWA:
+For local development, open another Terminal window and start the PWA:
 
 ```bash
 export HEARTH_REPO="$HOME/src/hearth"
 cd "$HEARTH_REPO"
-pnpm --filter @hearth/web dev -- --host 127.0.0.1
+pnpm --filter @hearth/web exec vite --host 127.0.0.1
 ```
 
 Verify the current application:
@@ -677,6 +761,13 @@ curl -fsS http://127.0.0.1:8787/healthz | jq .
 curl -fsS http://127.0.0.1:8787/readyz | jq .
 open http://127.0.0.1:5173
 ```
+
+For a built same-origin gateway, run `pnpm --filter @hearth/web start:prod`
+with `HEARTH_WEB_HOST=127.0.0.1`, `HEARTH_WEB_PORT=5174`, and
+`HEARTH_TAILSCALE_ALLOWED_USERS` set to the exact approved tailnet login
+identity. Tailscale Serve must target this loopback gateway on port 5174. Do
+not expose port 8787, Home Assistant, OpenClaw, Bonsai, or GLiNER2 through
+Serve.
 
 Run the repository doctor with the same environment:
 
@@ -689,55 +780,114 @@ export HEARTH_EXTRACT_URL=http://127.0.0.1:8770
 node apps/control/dist/src/main.js doctor
 ```
 
-The doctor can prove reachability of GLiNER2. It cannot prove that normal control requests use the sidecar because the current startup path does not pass the URL into `wireControl()`.
+The doctor checks GLiNER2, Home Assistant, and the authenticated OpenClaw
+Gateway. The `/readyz` response also confirms how many controllable devices
+Hearth imported.
 
-## 13. Required implementation before live Hearth use
+### Managed startup and recovery
 
-These are code changes, not additional setup commands:
+The macOS LaunchAgent installer starts the local Bonsai server, GLiNER2
+sidecar, live control service, and production PWA at login. Each job uses
+`KeepAlive` with a 10-second restart throttle. Tokens and the exact actuator
+allowlist are read from owner-only files under the runtime secrets directory;
+they are not copied into LaunchAgent property lists. Control and PWA bind only
+to `127.0.0.1`. OpenClaw keeps its existing LaunchAgent, and Home Assistant
+keeps its existing Docker restart policy.
 
-1. Implement a real Home Assistant adapter with REST and WebSocket support. It must import areas, devices, entities, capabilities, availability, and state versions. Dispatch must remain behind the executor.
-2. Make `apps/control/src/main.ts` honor `HEARTH_FIXTURE_MODE`, `HEARTH_HA_URL`, and `HEARTH_HA_TOKEN`. Default to fixture mode unless live mode is explicitly selected.
-3. Pass `HEARTH_EXTRACT_URL` into `wireControl({ gliner2_http_url: ... })`.
-4. Correct and test the GLiNER2 schema translation against the pinned GLiNER2 2.0.0 package.
-5. Add `packages/openclaw-adapter/` as a restricted Gateway client with no actuation tools, shell, browser, general HTTP, household credentials, or executor database access.
-6. Implement `BonsaiProvider` through that OpenClaw adapter. Require schema-constrained output, validate again server-side, allow at most one formatting retry, and fail closed.
-7. Update `models/bonsai.lock.json` with the exact revision, filename, SHA-256, Apache-2.0 notices, llama.cpp version or commit, Metal build profile, context, template compatibility, and measured peak memory.
-8. Add startup and doctor checks for Bonsai, OpenClaw, Home Assistant, and the actual selected providers.
-9. Run the Stage 0 real OpenClaw-to-Bonsai round trip.
-10. Run the Stage 3 evaluation with at least 200 reviewed cases and zero admitted wrong-target or unauthorized proposals.
+Stop the existing foreground services gracefully and confirm ports 8080, 8770,
+8787, and 5174 are free before installing the agents. The installer refuses
+to start duplicate listeners:
 
-Until those changes land, keep Home Assistant read-only from Hearth and keep household actuation disabled.
+```bash
+cd "$HEARTH_REPO"
+node scripts/macos/launch-agents.mjs install
+```
+
+The LaunchAgents run in the logged-in user's GUI session, including while the
+screen is locked. The user must remain logged in, and Docker Desktop must start
+at login for the existing Home Assistant container's restart policy to take
+effect. Tailscale Serve should use its persistent background mode after the
+identity allowlist and tailnet grants are reviewed. Remove the Hearth agents
+without deleting runtime data or secrets with:
+
+```bash
+node scripts/macos/launch-agents.mjs uninstall
+```
+
+## 13. Implementation status and remaining gates
+
+Updated 2026-09-27. Stage 0, Stage 1 fixture checks, and the frozen Stage 3
+synthetic corpus checks pass on this host. The running GLiNER2 sidecar uses the
+local v5 LoRA pilot. Separate v7 pilot results are diagnostics, not the Stage 3
+gate.
+
+1. **Complete:** Home Assistant adapter, with fixture mode as the default and live dispatch gated by the executor and explicit entity allowlist.
+2. **Complete:** Environment-driven fixture/live adapter selection in `apps/control/src/main.ts`.
+3. **Complete:** `HEARTH_EXTRACT_URL` is passed to the interpreter.
+4. **Complete:** GLiNER2 schema translation is covered against the pinned 2.0.0 package.
+5. **Complete:** `packages/openclaw-adapter/` uses the pinned Gateway WebSocket client, loopback-only, without actuation tools or household access.
+6. **Complete:** `BonsaiProvider` sends a compact output contract and applies strict server-side validation. Accepted agent runs are not retried.
+7. **Remaining:** Complete the Bonsai lock with exact source revision, checksum, license notices, llama.cpp build details, prompt-template compatibility, and measured peak memory.
+8. **Complete for Stage 0:** doctor verifies GLiNER2 health, Home Assistant reachability, and the authenticated OpenClaw Gateway handshake. Live control is limited to the two user-approved lamp entity IDs.
+9. **Complete:** A real local Bonsai interpretation passed Hearth's proposal validation.
+10. **Complete for the frozen Stage 3 corpus:** grammar, GLiNER2-only, and
+    combined evaluations each pass 200 cases with 150/150 exact supported
+    cases and zero wrong-target, unauthorized, or dropped-exclusion outcomes.
 
 ### Items landed in v3.0.10 (this branch)
 
 The following items from the punch list above have been implemented and unit-tested against fixture gates (live-resource tests still need to be run on the deployment Mac; see below for operator commands):
 
-1. **Real HA adapter (item 1):** `packages/ha-adapter/src/live.ts` implements REST endpoints (`/api/`, `/api/states`, `/api/areas`, `/api/registry`, `/api/services/<domain>/<service>`, `/api/states/<entity_id>`) with a WebSocket subscribe scaffold. Areas + entity-registry + states are mapped into Hearth's `DeviceRecord` / `Room` shapes. Sensors are filtered out of `listDevices()` because they have no commands. The `HAConnectionPool` accepts an `(seed, 'ha', adapter)` overload so `main.ts` can swap in the live adapter.
+1. **Real HA adapter (item 1):** `packages/ha-adapter/src/live.ts` uses REST for `/api/`, `/api/states`, and `/api/services/<domain>/<service>`, and the authenticated WebSocket API for the area, device, and entity registries plus state subscriptions. Registry areas, entity registry, and states are mapped into Hearth's `DeviceRecord` / `Room` shapes. Sensors are filtered out of `listDevices()` because they have no commands. The `HAConnectionPool` accepts an `(seed, 'ha', adapter)` overload so `main.ts` can swap in the live adapter.
 2. **Env-driven control service (item 2):** `apps/control/src/main.ts` reads `HEARTH_FIXTURE_MODE` (default `'1'`, safe), `HEARTH_HA_URL`, and `HEARTH_HA_TOKEN`. Live mode is fail-closed: it requires both env vars and a working `probe()` of `HEARTH_HA_URL`.
 3. **`HEARTH_EXTRACT_URL` plumbed (item 3):** `main.ts` reads the variable and threads it through `wireControl()` via conditional spread so the interpreter's GLiNER2 provider runs against the real sidecar when set.
 4. **GLiNER2 schema translation (item 4):** `apps/extract/hearth_extract/__init__.py` calls the pinned `gliner2==2.0.0` API using `schema=...` (not `entity_types=...`).
-5. **`packages/openclaw-adapter/` (item 5):** Loopback-only `OpenClawBonsaiProvider`. No actuation tools, no shell, no browser, no general HTTP, no household credentials, no executor DB access. Pure JSON-schema-constrained Bonsai proposer against `http://127.0.0.1` (or `[::1]`).
-6. **`BonsaiProvider` through the adapter (item 6):** Implements `BonsaiProvider.propose()` + `validateProposal()`. One retry on transient 5xx; never retry on validation failure. Server-side strict JSON-Schema validation; invalid output -> `ProposalValidationError`, never silent repair.
-7. **`models/openclaw.lock.json` (item 7, partial):** Source file lives at `packages/openclaw-adapter/src/lock.ts` (TS module so the build verifies structure). `pinned_version` is `HEARTH_OPENCLAW_PIN` (drift-proof); `commit_sha` + `llama_cpp_commit_sha` are operator-fillable (`PENDING_OPERATOR_VERIFICATION`). Release-time verification (`HEARTH_RELEASE=1`) requires real SHAs. `models/bonsai.lock.json` remains a stub awaiting operator measurements.
-8. **Doctor checks for live resources (item 8):** `apps/control/src/main.ts` doctor adds `ha-reachable` (live-mode `/api/` probe) and `openclaw-reachable` (`/agent/turn` probe + loopback guard + token guard). `scripts/verify-openclaw-lock.mjs` verifier checks the lock structure.
-9. **Stage 0 round-trip (item 9):** `apps/control/tests/round-trip.test.ts` exercises the full chain against an in-process HTTP server pretending to be OpenClaw, validating that `propose()` -> `validateProposal()` -> `IntentProposal` round-trips correctly with retry, pin drift, and invalid-output rejection.
-10. **Stage 3 evaluation (item 10):** Not yet implemented. See evaluation harness section in this same doc (forthcoming) for the operator commands to construct the corpus.
+5. **`packages/openclaw-adapter/` (item 5):** Loopback-only `OpenClawBonsaiProvider` uses the pinned `@openclaw/gateway-client` and protocol packages over Gateway WebSocket RPC. It grants only the `operator.write` scope needed for agent turns. No actuation tools, shell, browser, general HTTP, household credentials, or executor DB access.
+6. **`BonsaiProvider` through the adapter (item 6):** Implements `BonsaiProvider.propose()` + `validateProposal()`. Agent turns use the request ID as an idempotency key. Accepted runs are never resubmitted; timeouts surface as uncertain. Hearth parses the streamed result and applies strict server-side proposal validation. Invalid output fails closed without silent repair.
+7. **Model locks (partial):** OpenClaw's version and adapter package locks are verified. Bonsai lock metadata still needs exact source revision, checksum, llama.cpp build details, prompt-template compatibility, license notices, and measured model-server peak memory before release.
+8. **Doctor checks for live resources (item 8):** `apps/control/src/main.ts` doctor adds `ha-reachable` (read-only `/api/` probe in live mode) and `openclaw-reachable` (authenticated, loopback-only Gateway WebSocket handshake). `scripts/verify-openclaw-lock.mjs` verifies the lock structure.
+9. **Stage 0 round-trip (item 9):** The setup host completed a real local Bonsai interpretation through Hearth's Gateway RPC adapter. The returned JSON passed `validateProposalRaw()` and produced a typed `IntentProposal`. The adapter unit tests also cover request idempotency, stream parsing, and invalid output rejection.
+10. **Stage 3 evaluation (item 10):** Complete for the frozen synthetic corpus. The grammar, GLiNER2-only, and combined reports each cover 200 cases, with 150/150 exact supported cases, zero wrong-target admissions, zero unauthorized admissions, zero dropped exclusions, and zero sample failures. The corpus SHA-256 and report metrics are recorded in `docs/gates.md`. A separate Bonsai-only diagnostic was stopped before completion to keep Bonsai available for interactive use; it is not a Stage 3 gate.
 
-### Operator follow-up before claiming live Hearth
+### Verified operator evidence and remaining follow-up
 
-Until the operator completes the following on the deployment Mac, the doctor cannot turn the `openclaw-reachable` and `ha-reachable` checks PASS in live mode:
+The local session grants the PWA admin role for this loopback setup. The executor remains the only dispatch path. Home Assistant exposes distinct entity IDs with repeated friendly names for the two pilot lamps. Room expansion and contract resolution use the exact two user-approved entity routes. The Hue room group and all other imported devices remain excluded from actuation. No bridge reset or re-pairing is needed.
 
-- **Home Assistant live verification.** With `HEARTH_FIXTURE_MODE=0`, `HEARTH_HA_URL=http://127.0.0.1:8123`, and the long-lived token in `HEARTH_HA_TOKEN`, the doctor should report `[OK] ha-reachable`. The `LiveHAAdapter` is wired through `HAConnectionPool('ha', adapter)`.
-- **OpenClaw Gateway live verification.** With `HEARTH_OPENCLAW_URL=http://127.0.0.1:8443` (or wherever OpenClaw's gateway listens) and `HEARTH_GATEWAY_TOKEN=$(<"$HEARTH_SECRET_DIR/openclaw-gateway-token")`, the doctor should report `[OK] openclaw-reachable`. Loopback-only is enforced; non-loopback URLs are refused.
+The remaining operator follow-up is:
+
+- **Home Assistant live verification.** The authenticated `/api/` probe passed. The original two-lamp command was run through Hearth's executor after the SmartThings entry reload, and both lamp states were confirmed on.
+- **SmartThings event-stream reliability.** On Home Assistant Core 2026.9.3, the SmartThings entry remained loaded while its SSE subscription logged truncated responses and timeouts. Reloading the existing config entry restored state synchronization. Hearth then confirmed the original two-lamp command through its executor. Similar stale-feed symptoms and reload recovery are tracked upstream in [Home Assistant Core issue 158874](https://github.com/home-assistant/core/issues/158874) and [issue 176244](https://github.com/home-assistant/core/issues/176244). No pairing or credential changes were made. If this recurs, inspect the SmartThings integration logs and reload that existing entry from Settings > Devices & services.
+- **OpenClaw Gateway live verification.** The pinned Gateway listens on `ws://127.0.0.1:18789`. Hearth uses the pinned OpenClaw Gateway WebSocket client and protocol packages. The setup-host doctor handshake and Bonsai interpretation both pass. The provider refuses non-loopback URLs and checks the Gateway's reported version against the pin.
+- **Managed process recovery.** The Hearth Bonsai, GLiNER2, control, and
+  production web LaunchAgents are installed. Their listeners are loopback-only,
+  and a graceful production web process exit was recovered automatically with
+  HTTP 200. A full host logout/login test is still pending.
 - **Bonsai lock SHA-256 (item 7, complete the lock).** Run on the deployment host:
   ```
   shasum -a 256 "$HEARTH_MODEL_DIR/Bonsai-27B-Q1_0.gguf"
   ```
   Then patch the SHAs into `models/bonsai.lock.json` and `packages/openclaw-adapter/src/lock.ts`.
+- **Household device review.** Hearth reads 56 HA device records and currently
+  enables two verified lamp entities for live actuation. The private review
+  sheet records 55 HA device registry IDs, 15 repeated friendly-name groups,
+  21 rows without make/model, and no failed state reads. Verify physical
+  identity and load for each route before extending the exact allowlist.
+- **iPad private access.** The local PWA currently creates an admin session
+  and loads device discovery. The Tailscale package install needs local macOS
+  administrator authorization, VPN configuration approval, and tailnet sign-in.
+  The Mac is locked in the current session, so Serve configuration and actual
+  iPad checks remain pending.
 
 ## 14. Stop the foreground services
 
-In each Terminal window running Bonsai, GLiNER2, Hearth control, or the PWA, press:
+When LaunchAgents are installed, unload them with:
+
+```bash
+node scripts/macos/launch-agents.mjs uninstall
+```
+
+For foreground development sessions, stop Bonsai, GLiNER2, Hearth control, or
+the PWA with:
 
 ```text
 Control-C

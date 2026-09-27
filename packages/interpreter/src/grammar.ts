@@ -126,12 +126,17 @@ type DeviceMatch = {
 
 export class GrammarParser {
   private readonly registry: GrammarRegistry;
+  private readonly room_lamp_entity_allowlist: ReadonlySet<string> | undefined;
 
-  public constructor(opts: { registry: GrammarRegistry }) {
+  public constructor(opts: {
+    registry: GrammarRegistry;
+    room_lamp_entity_allowlist?: ReadonlySet<string>;
+  }) {
     if (!opts || !opts.registry) {
       throw new Error('GrammarParser requires a registry');
     }
     this.registry = opts.registry;
+    this.room_lamp_entity_allowlist = opts.room_lamp_entity_allowlist;
   }
 
   /**
@@ -313,6 +318,13 @@ export class GrammarParser {
       if (hold) return hold;
     }
 
+    // Read-only state questions are deterministic once they name one
+    // resolved device. They do not pass through the actuator executor.
+    {
+      const query = await this.tryQueryState(normalized, request_id, pronoun_resolution);
+      if (query) return query;
+    }
+
     // (a) "run X" / "trigger X" -> routine-trigger
     {
       const m = matchRoutineTrigger(normalized);
@@ -369,6 +381,37 @@ export class GrammarParser {
     return { ok: false, reason: 'no supported pattern matched', residual_utterance: normalized };
   }
 
+  private async tryQueryState(
+    normalized: string,
+    request_id: string,
+    pronoun_resolution: PronounResolution,
+  ): Promise<GrammarMatchResult | null> {
+    const targetPhrase = (
+      /^(?:is|are)\s+(.+?)\s+(?:currently\s+)?(?:on|off|running|active)\??$/.exec(normalized)?.[1]
+      ?? /^(?:what(?:'s| is)\s+the\s+)?(?:current\s+)?(?:state|status)\s+of\s+(.+?)\??$/.exec(normalized)?.[1]
+      ?? /^check\s+(?:the\s+)?(?:state|status)\s+of\s+(.+?)\??$/.exec(normalized)?.[1]
+      ?? /^tell\s+me\s+whether\s+(.+?)\s+is\s+(?:on|off|running|active)\??$/.exec(normalized)?.[1]
+      ?? ''
+    );
+    if (!targetPhrase) return null;
+    const cleanedTarget = stripThe(targetPhrase).trim();
+    const device = await this.resolveTarget(cleanedTarget, pronoun_resolution);
+    if (!device) return this.rejectTarget(cleanedTarget, normalized);
+
+    const proposal = buildProposal({
+      request_id,
+      intent_family: 'query-state',
+      target_phrases: [device.friendly_name],
+      exclusions: [],
+      desired_values: {},
+      temporal: null,
+      unresolved_fields: [],
+      confidence: 1,
+      provenance: { source: 'grammar', matched_rule: 'query-state@1' },
+    });
+    return { ok: true, proposal };
+  }
+
   // ---------------------------------------------------------------------------
       // set-state (turn on / off, with or without exclusions)
       // ---------------------------------------------------------------------------
@@ -407,6 +450,13 @@ export class GrammarParser {
               residual_utterance: normalized,
             };
           }
+          const roomLamps = await this.buildRoomLampsSetState(
+            rest,
+            on,
+            request_id,
+            normalized,
+          );
+          if (roomLamps) return roomLamps;
           return this.buildSetState(rest, on, request_id, pronoun_resolution, 'turn-on-off@1', normalized);
         }
 
@@ -450,6 +500,70 @@ export class GrammarParser {
     }
 
     return null;
+  }
+
+  /**
+   * Expand an explicit "the <room> lamps" request to individually named
+   * light devices in that exact room. Room/group entities are excluded by
+   * requiring each target's friendly name to contain the word "lamp".
+   */
+  private async buildRoomLampsSetState(
+    target_phrase_raw: string,
+    on: boolean,
+    request_id: string,
+    full_utterance: string,
+  ): Promise<GrammarMatchResult | null> {
+    const match = /^(?:the\s+)?(.+?)\s+lamps?$/.exec(stripThe(target_phrase_raw).trim());
+    if (!match?.[1]) return null;
+    const snapshot = this.registry.snapshot?.();
+    if (!snapshot) return null;
+
+    const roomPhrase = match[1].trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+    const matchingRooms = snapshot.rooms.filter((room) =>
+      room.name.trim().toLocaleLowerCase().replace(/\s+/g, ' ') === roomPhrase,
+    );
+    if (matchingRooms.length !== 1) return null;
+
+    const room = matchingRooms[0]!;
+    const members = new Set(room.device_ids.map(String));
+    const roomLampEntityAllowlist = this.room_lamp_entity_allowlist;
+    const targets = snapshot.devices.filter((device) =>
+      members.has(String(device.canonical_id))
+      && device.load_type === 'light'
+      && /\blamps?\b/i.test(device.friendly_name)
+      && (roomLampEntityAllowlist === undefined || device.provider_ids.some((provider) =>
+        provider.kind === 'ha' && roomLampEntityAllowlist.has(provider.entity_id),
+      )),
+    );
+    if (targets.length === 0) {
+      return {
+        ok: false,
+        reason: `room "${room.name}" has no individually named lamp devices`,
+        residual_utterance: full_utterance,
+      };
+    }
+
+    const names = targets.map((device) => device.friendly_name.trim().toLocaleLowerCase());
+    if (new Set(names).size !== targets.length) {
+      return {
+        ok: false,
+        reason: `room "${room.name}" has ambiguous lamp names`,
+        residual_utterance: full_utterance,
+      };
+    }
+
+    const proposal = buildProposal({
+      request_id,
+      intent_family: 'set-state',
+      target_phrases: targets.map((device) => device.friendly_name),
+      exclusions: [],
+      desired_values: { on },
+      temporal: null,
+      unresolved_fields: [],
+      confidence: 1,
+      provenance: { source: 'grammar', matched_rule: 'room-lamps@1' },
+    });
+    return { ok: true, proposal };
   }
 
   private async buildSetState(

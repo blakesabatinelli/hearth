@@ -29,6 +29,9 @@ describe('parseHash', () => {
   it('returns history for "#/history"', () => {
     expect(parseHash('#/history')).toBe('history');
   });
+  it.each(['rooms', 'favorites', 'routines', 'attention', 'devices'] as const)('returns %s for its route', (route) => {
+    expect(parseHash(`#/${route}`)).toBe(route);
+  });
   it('falls back to home for unknown routes', () => {
     expect(parseHash('#/nope')).toBe('home');
   });

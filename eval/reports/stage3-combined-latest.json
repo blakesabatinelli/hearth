@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "evaluated_at": "2026-09-27T19:11:52.100Z",
+  "mode": "combined",
+  "corpus_cases": 200,
+  "supported_unambiguous_cases": 150,
+  "exact_supported": 150,
+  "exact_supported_rate": 1,
+  "wrong_target_admitted": 0,
+  "unauthorized_admitted": 0,
+  "dropped_exclusions": 0,
+  "admitted_total": 150,
+  "clarification_supported": 0,
+  "gliner2_invocations": 39,
+  "bonsai_invocations": 39,
+  "bonsai_invocation_rate": 0.195,
+  "mean_latency_ms": 15992.2,
+  "peak_rss_bytes": 50229312,
+  "by_category": {
+    "set-state": {
+      "count": 80,
+      "exact": 80,
+      "admitted": 80,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "brightness-absolute": {
+      "count": 30,
+      "exact": 30,
+      "admitted": 30,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "brightness-relative": {
+      "count": 20,
+      "exact": 20,
+      "admitted": 20,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "single-exclusion": {
+      "count": 20,
+      "exact": 20,
+      "admitted": 20,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "unclassified-load": {
+      "count": 8,
+      "exact": 8,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "compound-action": {
+      "count": 8,
+      "exact": 8,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "multiple-exclusions": {
+      "count": 8,
+      "exact": 8,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "speech-or-unknown-target": {
+      "count": 8,
+      "exact": 8,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "ambiguous-target": {
+      "count": 8,
+      "exact": 8,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    },
+    "unsupported-or-policy-boundary": {
+      "count": 10,
+      "exact": 10,
+      "admitted": 0,
+      "wrong_target": 0,
+      "unauthorized": 0,
+      "dropped_exclusions": 0
+    }
+  },
+  "sample_failures": []
+}

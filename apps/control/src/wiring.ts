@@ -18,6 +18,7 @@ import {
   type Actor,
   type ActorRole,
   type IdempotencyKey,
+  type IntentProposal,
 } from '@hearth/contracts';
 import {
   ContractExecutor,
@@ -36,6 +37,7 @@ import type {
   HomeAssistantAdapter,
 } from '@hearth/contracts';
 import { HearthExtractHttpClient, MockGliner2 } from '@hearth/extractor';
+import { isValidTimeZone, type ScheduleStore } from '@hearth/scheduler';
 
 import { HearthToExecutorRegistry } from './registry-adapter.js';
 import { SessionStore, COOKIE, csrfValid, readSession, setSessionCookie, clearSessionCookie, actorForRole } from './session.js';
@@ -47,6 +49,8 @@ export type WireOptions = {
   readonly registry: HearthRegistryOverlay;
   readonly adapter: HomeAssistantAdapter;
   readonly store: ExecutionStore;
+  /** Durable scheduler store supplied by the production runtime. */
+  readonly schedule_store?: ScheduleStore;
   readonly clock: Clock;
   /** Override GLiNER2 provider. Default: MockGliner2 (deterministic, for tests/CI). */
   readonly gliner2?: ExtractionProvider | null;
@@ -62,6 +66,8 @@ export type WireOptions = {
    * `hearth-extract` Python sidecar.
    */
   readonly gliner2_http_url?: string;
+  /** Exact HA entities approved in this live process. Omitted in fixture mode. */
+  readonly live_ha_actuation_allowlist?: ReadonlySet<string>;
 };
 
 export type WiredControl = {
@@ -91,6 +97,9 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
     registry: opts.registry,
     gliner2: gliner2_provider,
     bonsai: opts.bonsai ?? null,
+    ...(opts.live_ha_actuation_allowlist !== undefined
+      ? { room_lamp_entity_allowlist: opts.live_ha_actuation_allowlist }
+      : {}),
   });
 
   const session_store = new SessionStore(opts.session_secret ? { secret: opts.session_secret } : {});
@@ -281,6 +290,7 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
     const request_id = body.request_id ?? randomUUID();
     const idempotency_key = request_id as IdempotencyKey;
     const actor: Actor = { ...session.actor, session_id: session.session_id };
+    const proposal = body.proposal as IntentProposal;
 
     // v3.0.1: verify the proposal was produced by /v1/interpret in this
     // session. Hand-built proposals are rejected.
@@ -313,11 +323,38 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
         actor,
         request_id,
         idempotency_key,
-        proposal: body.proposal,
+        proposal,
         registry: executor_registry,
         resolve_phrase: async (phrase: string) => {
+          const is_safe_all_lights_off = phrase.trim().toLocaleLowerCase() === 'everything'
+            && proposal.intent_family === 'set-state'
+            && proposal.desired_values.on === false;
+          if (is_safe_all_lights_off) {
+            const devices = executor_registry.listDevices()
+              .filter((device) => device.load_type === 'light'
+                && device.capabilities.includes('on-off')
+                && device.allowed_actors.includes(actor.role));
+            return devices
+              .filter((device) => {
+                if (opts.live_ha_actuation_allowlist === undefined) return true;
+                const ha_entities = device.provider_ids
+                  .filter((provider) => provider.kind === 'ha')
+                  .map((provider) => provider.entity_id);
+                return ha_entities.some((entity_id) => opts.live_ha_actuation_allowlist!.has(entity_id));
+              })
+              .map((device) => ({ canonical_id: device.canonical_id }));
+          }
           const hits = await opts.registry.resolve(phrase);
-          return hits.map((h) => ({ canonical_id: h.device.canonical_id }));
+          return hits
+            .filter((hit) => {
+              if (opts.live_ha_actuation_allowlist === undefined) return true;
+              const ha_entities = hit.device.provider_ids
+                .filter((provider) => provider.kind === 'ha')
+                .map((provider) => provider.entity_id);
+              return ha_entities.length === 0
+                || ha_entities.some((entity_id) => opts.live_ha_actuation_allowlist!.has(entity_id));
+            })
+            .map((hit) => ({ canonical_id: hit.device.canonical_id }));
         },
         now: () => new Date(opts.clock.now()),
         expiry_seconds: body.expiry_seconds,
@@ -377,11 +414,283 @@ export async function wireControl(opts: WireOptions): Promise<WiredControl> {
     const devices = await opts.adapter.listDevices();
     const rooms = await opts.adapter.listRooms();
     return {
-      devices,
+      devices: devices.map((device) => ({
+        ...device,
+        control_enabled: device.allowed_actors.includes(session.actor.role),
+      })),
       rooms,
       actor: { actor_id: session.actor.actor_id, role: session.actor.role },
     };
   });
+
+  app.get<{ Querystring: { limit?: string } }>('/v1/receipts', async (req, reply) => {
+    const session = readSession(req, session_store);
+    if (!session) {
+      reply.code(401);
+      return { error: { code: 'no_session', message: 'no active session' } };
+    }
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      reply.code(400);
+      return { error: { code: 'invalid_limit', message: 'limit must be an integer from 1 to 100' } };
+    }
+    const receipts = executor.listReceipts()
+      .slice()
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, limit);
+    return { receipts };
+  });
+
+  // Routines are stored durably by the scheduler. The browser can request
+  // a light's friendly name or canonical ID, but identity, actor role, and
+  // allowed route are resolved and frozen by this server-side handler.
+  app.get('/v1/routines', async (req, reply) => {
+    const session = readSession(req, session_store);
+    if (!session) {
+      reply.code(401);
+      return { error: { code: 'no_session', message: 'no active session' } };
+    }
+    if (!opts.schedule_store) {
+      reply.code(503);
+      return { error: { code: 'scheduler_unavailable', message: 'routine storage is unavailable' } };
+    }
+    const routines = opts.schedule_store.listRoutines()
+      .filter((routine) => routine.role === session.actor.role)
+      .map((routine) => ({
+        routine_id: routine.routine_id,
+        name: routine.name,
+        cron: routine.cron,
+        intent_family: routine.intent_family,
+        target_phrases: routine.target_phrases,
+        desired_values: routine.desired_values,
+        exclusions: routine.exclusions,
+        enabled: routine.enabled,
+        recent_fires: opts.schedule_store!.listFiredForSchedule(routine.routine_id).slice(-5).reverse(),
+      }));
+    return { routines };
+  });
+
+  app.post<{ Body: Record<string, unknown> }>('/v1/routines', async (req, reply) => {
+    const session = readSession(req, session_store);
+    if (!session) {
+      reply.code(401);
+      return { error: { code: 'no_session', message: 'no active session' } };
+    }
+    if (!csrfValid(req, session)) {
+      reply.code(403);
+      return { error: { code: 'csrf_invalid', message: 'CSRF token missing or wrong' } };
+    }
+    if (!opts.schedule_store) {
+      reply.code(503);
+      return { error: { code: 'scheduler_unavailable', message: 'routine storage is unavailable' } };
+    }
+    const body = req.body;
+    const allowedKeys = new Set(['name', 'time_local', 'time_zone', 'target_canonical_id', 'on']);
+    if (!body || Object.keys(body).some((key) => !allowedKeys.has(key))) {
+      reply.code(400);
+      return { error: { code: 'invalid_body', message: 'only name, time_local, time_zone, target_canonical_id, and on are accepted' } };
+    }
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const timeLocal = typeof body.time_local === 'string' ? body.time_local : '';
+    const timeZone = typeof body.time_zone === 'string' ? body.time_zone : '';
+    const canonicalId = typeof body.target_canonical_id === 'string' ? body.target_canonical_id : '';
+    if (!name || name.length > 80 || !/^([01]\d|2[0-3]):[0-5]\d$/.test(timeLocal)
+      || !isValidTimeZone(timeZone) || !canonicalId || typeof body.on !== 'boolean') {
+      reply.code(400);
+      return { error: { code: 'invalid_body', message: 'provide a name, local time in HH:MM, a valid IANA time zone, an exact light ID, and an on/off value' } };
+    }
+    const hits = await opts.registry.resolve(canonicalId);
+    if (hits.length !== 1 || hits[0]!.device.canonical_id !== canonicalId) {
+      reply.code(422);
+      return { error: { code: 'invalid_target', message: 'target must identify exactly one current device' } };
+    }
+    const device = hits[0]!.device;
+    if (device.load_type !== 'light' || !device.capabilities.includes('on-off')) {
+      reply.code(422);
+      return { error: { code: 'unsupported_target', message: 'scheduled routines currently support classified lights only' } };
+    }
+    if (!device.allowed_actors.includes(session.actor.role)) {
+      reply.code(403);
+      return { error: { code: 'device_forbidden', message: 'this session is not authorized for that device' } };
+    }
+    if (opts.live_ha_actuation_allowlist !== undefined) {
+      const entityIds = device.provider_ids.filter((provider) => provider.kind === 'ha').map((provider) => provider.entity_id);
+      if (!entityIds.some((entityId) => opts.live_ha_actuation_allowlist!.has(entityId))) {
+        reply.code(403);
+        return { error: { code: 'device_forbidden', message: 'device is not in Hearth\'s live actuation allowlist' } };
+      }
+    }
+    const [hour, minute] = timeLocal.split(':').map(Number);
+    const nowParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date());
+    const nowHour = Number(nowParts.find((part) => part.type === 'hour')?.value);
+    const nowMinute = Number(nowParts.find((part) => part.type === 'minute')?.value);
+    const minutesUntil = (hour! * 60 + minute!) - (nowHour * 60 + nowMinute);
+    if (minutesUntil >= 0 && minutesUntil < 2) {
+      reply.code(422);
+      return { error: { code: 'schedule_too_soon', message: 'choose a time at least two minutes from now to avoid an immediate run' } };
+    }
+    const routine = {
+      routine_id: randomUUID(),
+      name,
+      cron: `${minute} ${hour} * * *`,
+      time_zone: timeZone,
+      intent_family: 'set-state' as const,
+      target_phrases: [canonicalId],
+      desired_values: { on: body.on },
+      exclusions: [],
+      role: session.actor.role,
+      enabled: true,
+    };
+    opts.schedule_store.upsertRoutine(routine);
+    reply.code(201);
+    return { routine: { ...routine, role: undefined, recent_fires: [] } };
+  });
+
+  app.patch<{ Params: { id: string }; Body: Record<string, unknown> }>('/v1/routines/:id', async (req, reply) => {
+    const session = readSession(req, session_store);
+    if (!session) {
+      reply.code(401);
+      return { error: { code: 'no_session', message: 'no active session' } };
+    }
+    if (!csrfValid(req, session)) {
+      reply.code(403);
+      return { error: { code: 'csrf_invalid', message: 'CSRF token missing or wrong' } };
+    }
+    if (!opts.schedule_store) {
+      reply.code(503);
+      return { error: { code: 'scheduler_unavailable', message: 'routine storage is unavailable' } };
+    }
+    if (Object.keys(req.body ?? {}).length !== 1 || typeof req.body.enabled !== 'boolean') {
+      reply.code(400);
+      return { error: { code: 'invalid_body', message: 'only an enabled boolean is accepted' } };
+    }
+    const routine = opts.schedule_store.listRoutines().find((item) => item.routine_id === req.params.id);
+    if (!routine || routine.role !== session.actor.role) {
+      reply.code(404);
+      return { error: { code: 'routine_not_found', message: 'routine not found' } };
+    }
+    opts.schedule_store.upsertRoutine({ ...routine, enabled: req.body.enabled });
+    return { routine_id: routine.routine_id, enabled: req.body.enabled };
+  });
+
+  app.delete<{ Params: { id: string } }>('/v1/routines/:id', async (req, reply) => {
+    const session = readSession(req, session_store);
+    if (!session) {
+      reply.code(401);
+      return { error: { code: 'no_session', message: 'no active session' } };
+    }
+    if (!csrfValid(req, session)) {
+      reply.code(403);
+      return { error: { code: 'csrf_invalid', message: 'CSRF token missing or wrong' } };
+    }
+    if (!opts.schedule_store) {
+      reply.code(503);
+      return { error: { code: 'scheduler_unavailable', message: 'routine storage is unavailable' } };
+    }
+    const routine = opts.schedule_store.listRoutines().find((item) => item.routine_id === req.params.id);
+    if (!routine || routine.role !== session.actor.role) {
+      reply.code(404);
+      return { error: { code: 'routine_not_found', message: 'routine not found' } };
+    }
+    opts.schedule_store.removeRoutine(routine.routine_id);
+    return { routine_id: routine.routine_id, status: 'deleted' };
+  });
+
+  // Direct, touch-friendly controls still create a normal server-owned
+  // proposal and contract. The executor remains the only actuation path.
+  // This endpoint deliberately supports verified light on/off only; other
+  // load types need explicit service semantics and policy before exposure.
+  app.post<{ Params: { id: string }; Body: { desired_values?: unknown } }>(
+    '/v1/devices/:id/control',
+    async (req, reply) => {
+      const session = readSession(req, session_store);
+      if (!session) {
+        reply.code(401);
+        return { error: { code: 'no_session', message: 'no active session' } };
+      }
+      if (!csrfValid(req, session)) {
+        reply.code(403);
+        return { error: { code: 'csrf_invalid', message: 'CSRF token missing or wrong' } };
+      }
+
+      const body = req.body as Record<string, unknown> | null;
+      if (!body || Object.keys(body).some((key) => key !== 'desired_values')) {
+        reply.code(400);
+        return { error: { code: 'invalid_body', message: 'only desired_values is accepted' } };
+      }
+      const desired = body.desired_values;
+      if (typeof desired !== 'object' || desired === null || Array.isArray(desired)) {
+        reply.code(400);
+        return { error: { code: 'invalid_body', message: 'desired_values must contain on: true or on: false' } };
+      }
+      const desired_values = desired as Record<string, unknown>;
+      if (Object.keys(desired_values).length !== 1 || typeof desired_values.on !== 'boolean') {
+        reply.code(400);
+        return { error: { code: 'invalid_body', message: 'desired_values must contain only on: true or on: false' } };
+      }
+
+      const device = opts.registry.device(req.params.id as import('@hearth/contracts').CanonicalId);
+      if (!device) {
+        reply.code(404);
+        return { error: { code: 'unknown_device', message: 'device not found' } };
+      }
+      if (device.load_type !== 'light' || !device.capabilities.includes('on-off')) {
+        reply.code(422);
+        return { error: { code: 'unsupported_control', message: 'direct controls currently support on/off for classified lights only' } };
+      }
+      if (!device.allowed_actors.includes(session.actor.role)) {
+        reply.code(403);
+        return { error: { code: 'device_forbidden', message: 'this session is not authorized for that device' } };
+      }
+      if (opts.live_ha_actuation_allowlist !== undefined) {
+        const ha_entities = device.provider_ids
+          .filter((provider) => provider.kind === 'ha')
+          .map((provider) => provider.entity_id);
+        if (ha_entities.length === 0 || !ha_entities.some((entity_id) => opts.live_ha_actuation_allowlist!.has(entity_id))) {
+          reply.code(403);
+          return { error: { code: 'device_forbidden', message: 'device is not in Hearth\'s live actuation allowlist' } };
+        }
+      }
+
+      const request_id = randomUUID();
+      const proposal: IntentProposal = {
+        request_id,
+        intent_family: 'set-state',
+        target_phrases: [String(device.canonical_id)],
+        exclusions: [],
+        desired_values: { on: desired_values.on },
+        temporal: null,
+        unresolved_fields: [],
+        confidence: 1,
+        provenance: { source: 'grammar', matched_rule: 'direct-light-control@1' },
+      };
+      try {
+        const { contract } = await buildContract({
+          actor: { ...session.actor, session_id: session.session_id },
+          request_id,
+          idempotency_key: request_id as IdempotencyKey,
+          proposal,
+          registry: executor_registry,
+          resolve_phrase: async (phrase) => (await opts.registry.resolve(phrase))
+            .map((hit) => ({ canonical_id: hit.device.canonical_id })),
+          now: () => new Date(opts.clock.now()),
+          observed_state: async (canonical_id) => {
+            try { return (await opts.adapter.getState(canonical_id as never)).state_version; }
+            catch { return 0; }
+          },
+        });
+        const receipt = await executor.dispatch(contract);
+        return { contract_id: contract.contract_id, receipt };
+      } catch (err) {
+        const mapped = mapDomainError(err);
+        reply.code(mapped.status);
+        return mapped.body;
+      }
+    },
+  );
 
   app.get<{ Params: { id: string } }>(
     '/v1/devices/:id/state',

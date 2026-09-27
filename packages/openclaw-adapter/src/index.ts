@@ -7,9 +7,9 @@
  * Architecture (plan section 13, items 5+6):
  *
  *   interpreter -> OpenClawBonsaiProvider.propose()
- *                   -> POST http://gateway/agent/turn?tool=bonsai_thinking
+ *                   -> pinned Gateway WebSocket RPC (agent + agent.wait)
  *                   -> Gateway calls Bonsai 27B 1-bit via llama-server (Metal)
- *                   -> Gateway returns JSON (validated against schema)
+ *                   -> streamed reply parsed and validated by Hearth
  *                   -> validateProposal() in this package
  *                   -> IntentProposal -> interpreter -> registry
  *
@@ -26,26 +26,22 @@
  *      openclaw-scope ADR (added by this change set).
  *   2. Loopback-only. The Gateway URL must resolve to 127.0.0.1.
  *      Anything else is rejected at construction time.
- *   3. Token-authenticated. HEARTH_GATEWAY_TOKEN (loaded by main.ts from
- *      $HEARTH_SECRET_DIR/openclaw-gateway-token) is sent as a bearer
- *      on every request. The token never logs.
- *   4. Strict JSON schema. The adapter feeds Bonsai a JSON Schema and
- *      asks for JSON. The reply is validated against the schema server-
- *      side. Invalid -> clarify/fail, NEVER silent repair.
- *   5. One retry max on transient network failure. No retry on
- *      validation failure (that's a Bonsai/confusion error, not
- *      transient).
+ *   3. Token-authenticated Gateway handshake. The token never logs.
+ *   4. Strict server-side proposal validation. A compact output contract
+ *      is sent to Bonsai; invalid output fails closed without repair.
+ *   5. Agent runs use an idempotency key and are never resubmitted after
+ *      acceptance. A timeout is surfaced as uncertain, not retried.
  *   6. Pinned version. OPENCLAW_PIN ('2026.9.6') is enforced in the
  *      adapter options and the lock file. Pin committed to
  *      models/openclaw.lock.json (item 7).
  *
- * Stage 0 round-trip (item 9): a smoke test feeds a fixed utterance
- * and asserts the response round-trips validateProposal. The unit
- * tests in tests/openclaw.test.ts use a fake gateway.
+ * Stage 0 round-trip (item 9): live local Bonsai output is validated
+ * before it is returned as an IntentProposal. Unit tests use a fake gateway.
  */
 
 export {
   OpenClawBonsaiProvider,
+  probeOpenClawGateway,
   OpenClawPermanentError,
   OpenClawPinError,
   OpenClawTransientError,

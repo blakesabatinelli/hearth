@@ -103,6 +103,19 @@ describe('registry overlay', () => {
     expect(matches.length).toBe(0);
   });
 
+  it('does not resolve a generic device-type word from one friendly name token', async () => {
+    const kitchenLights: DeviceRecord = {
+      ...lamp,
+      canonical_id: 'd-kitchen-lights' as CanonicalId,
+      friendly_name: 'Kitchen Lights',
+      aliases: ['main lights'],
+      provider_ids: [{ kind: 'ha', entity_id: 'light.kitchen_main' }],
+    };
+    const r = new RegistryOverlay({ ...baseState, devices: [...baseState.devices, kitchenLights] });
+    expect(await r.resolve('lights')).toEqual([]);
+    expect((await r.resolve('main lights')).map((item) => item.device.canonical_id)).toEqual(['d-kitchen-lights']);
+  });
+
   it('permission gate honors allowed_actors', async () => {
     const r = new RegistryOverlay(baseState);
     expect(await r.allowed('d-lamp' as CanonicalId, 'member')).toBe(true);

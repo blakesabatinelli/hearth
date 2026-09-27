@@ -113,7 +113,11 @@ export const PROPOSAL_JSON_SCHEMA = {
 export function buildSystemPrompt(): string {
   return [
     'You are Bonsai, the planning model for Hearth.',
-    'You ONLY emit JSON matching the supplied schema. No prose outside the JSON.',
+    'Reply with exactly one JSON object and no prose or Markdown.',
+    'Use these keys: request_id, intent_family, target_phrases, exclusions, desired_values, temporal, unresolved_fields, confidence, provenance.',
+    'intent_family must be one of set-state, set-brightness-absolute, set-brightness-relative, set-scene, hold-until, routine-trigger, query-state, unsupported.',
+    'Use arrays for target_phrases, exclusions, and unresolved_fields. Use an object for desired_values. Use null for temporal when there is no time condition.',
+    'Set provenance to {"source":"bonsai","adapter_id":"openclaw","schema_version":"0.0.1"}.',
     `Schema version: ${PROPOSAL_SCHEMA_VERSION}.`,
     'You never invent device IDs, tokens, or URLs.',
     'You never propose an action. You propose an INTERPRETATION. Hearth decides whether to act.',

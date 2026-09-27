@@ -15,6 +15,8 @@ import type {
   ExtractionResult,
   ExtractionSchema,
   IntentProposal,
+  Room,
+  RoomId,
   StateObservation,
 } from '@hearth/contracts';
 import {
@@ -35,6 +37,7 @@ function device(args: {
   id: string;
   friendly_name: string;
   aliases?: ReadonlyArray<string>;
+  room_id?: RoomId | null;
 }): DeviceRecord {
   return {
     canonical_id: args.id as CanonicalId,
@@ -43,18 +46,20 @@ function device(args: {
     capabilities: ['on-off', 'brightness'],
     aliases: args.aliases ?? [],
     provider_ids: [{ kind: 'ha', entity_id: `light.${args.id}` }],
-    room_id: null,
+    room_id: args.room_id ?? null,
     allowed_actors: ['admin', 'member'],
     route_preference: 'ha-only',
     version: 1,
   };
 }
 
-function makeRegistry(): GrammarRegistry {
-  const devices = [
+function makeRegistry(
+  devices: ReadonlyArray<DeviceRecord> = [
     device({ id: 'd-lamp', friendly_name: 'Living Room Lamp', aliases: ['main lamp'] }),
     device({ id: 'd-office', friendly_name: 'Office Light' }),
-  ];
+  ],
+  rooms: ReadonlyArray<Room> = [],
+): GrammarRegistry {
   return {
     resolve: async (phrase: string): Promise<ReadonlyArray<GrammarResolution>> => {
       const norm = phrase.trim().toLowerCase();
@@ -84,7 +89,7 @@ function makeRegistry(): GrammarRegistry {
     },
     snapshot: () => ({
       devices,
-      rooms: [],
+      rooms,
       entity_version: 1,
       scene_versions: {},
     }),
@@ -98,7 +103,7 @@ function makeRegistry(): GrammarRegistry {
  *   - "fail": throw
  */
 class MockGliner2 implements ExtractionProvider {
-  public mode: 'complete' | 'partial' | 'fail' = 'complete';
+  public mode: 'complete' | 'partial' | 'partial-exclusion' | 'fail' | 'room-lamps' | 'routine-trigger' = 'complete';
   public call_count = 0;
   public readonly checkpoint = 'fastino/gliner2.5-base-v1';
   public readonly schema_version = '1';
@@ -111,7 +116,19 @@ class MockGliner2 implements ExtractionProvider {
     const entities: Record<string, ReadonlyArray<string>> = {};
     const classifications: Array<{ label: ExtractionLabel; span: string }> = [];
     const unresolved: string[] = [];
-    if (this.mode === 'complete') {
+    if (this.mode === 'partial-exclusion') {
+      entities['device_target'] = ['Living Room Lamp'];
+      classifications.push({ label: 'on', span: 'turn on' });
+      unresolved.push('exclusion');
+    } else if (this.mode === 'routine-trigger') {
+      entities['device_target'] = ['bedtime routine'];
+      entities['value_expression'] = ['bedtime'];
+      classifications.push({ label: 'routine_trigger', span: 'execute bedtime' });
+    } else if (this.mode === 'room-lamps') {
+      entities['device_target'] = ['lamps'];
+      entities['room'] = ['Master Bedroom'];
+      classifications.push({ label: 'on', span: 'illuminate' });
+    } else if (this.mode === 'complete') {
       entities['device_target'] = ['Living Room Lamp'];
       entities['value_expression'] = ['40'];
       classifications.push({ label: 'set_brightness', span: 'set to 40' });
@@ -127,7 +144,7 @@ class MockGliner2 implements ExtractionProvider {
       classifications,
       relations: [],
       unresolved,
-      confidence: this.mode === 'complete' ? 0.92 : 0.5,
+      confidence: this.mode === 'complete' || this.mode === 'partial-exclusion' || this.mode === 'room-lamps' || this.mode === 'routine-trigger' ? 0.92 : 0.5,
       original_utterance: req.utterance,
     };
   }
@@ -190,9 +207,8 @@ describe('Interpreter', () => {
     expect(bonsai.call_count).toBe(0);
   });
 
-  it('grammar fail + GLiNER2 complete -> ready_for_contract with provenance gliner2', async () => {
-    // An utterance the grammar can't parse.
-    const decision = await interpreter.interpret('turn on the celestia lamp', 'req-i1');
+  it('grammar fail + grounded GLiNER2 interpretation -> ready_for_contract', async () => {
+    const decision = await interpreter.interpret('please make the main lamp brightness 40', 'req-i1');
     expect(decision.outcome).toBe('ready_for_contract');
     if (decision.outcome !== 'ready_for_contract') return;
     expect(decision.proposal.provenance.source).toBe('gliner2');
@@ -200,13 +216,98 @@ describe('Interpreter', () => {
     expect(bonsai.call_count).toBe(0);
   });
 
-  it('grammar fail + GLiNER2 partial + Bonsai success -> ready_for_contract composed provenance', async () => {
+  it('GLiNER2 room plus generic lamps expands only to named lights in that room', async () => {
+    const roomId = 'master-bedroom' as RoomId;
+    const bedroom: Room = {
+      room_id: roomId,
+      name: 'Master Bedroom',
+      device_ids: ['alpha-lamp', 'beta-lamp', 'bedroom-group', 'candle'] as CanonicalId[],
+    };
+    registry = makeRegistry([
+      device({ id: 'alpha-lamp', friendly_name: "alpha's Lamp", room_id: roomId }),
+      device({ id: 'beta-lamp', friendly_name: "beta's Lamp", room_id: roomId }),
+      device({ id: 'bedroom-group', friendly_name: 'Master Bedroom', room_id: roomId }),
+      device({ id: 'candle', friendly_name: 'Bedroom Candle', room_id: roomId }),
+    ], [bedroom]);
+    gliner2.mode = 'room-lamps';
+    interpreter = new Interpreter({ registry, gliner2, bonsai });
+
+    const decision = await interpreter.interpret('please illuminate the Master Bedroom lamps', 'req-gliner-room-lamps');
+
+    expect(decision.outcome).toBe('ready_for_contract');
+    if (decision.outcome !== 'ready_for_contract') return;
+    expect(decision.proposal.target_phrases).toEqual(["alpha's Lamp", "beta's Lamp"]);
+    expect(decision.proposal.provenance.source).toBe('gliner2');
+    expect(bonsai.call_count).toBe(0);
+  });
+
+  it('routine names come from value expressions, never device targets', async () => {
+    gliner2.mode = 'routine-trigger';
+    interpreter = new Interpreter({ registry, gliner2, bonsai });
+
+    const decision = await interpreter.interpret('Can you execute the bedtime routine?', 'req-gliner-routine');
+
+    expect(decision.outcome).toBe('ready_for_contract');
+    if (decision.outcome !== 'ready_for_contract') return;
+    expect(decision.proposal.intent_family).toBe('routine-trigger');
+    expect(decision.proposal.target_phrases).toEqual(['bedtime']);
+    expect(bonsai.call_count).toBe(0);
+  });
+
+  it('GLiNER2 room expansion filters duplicate HA names through the exact allowlist', async () => {
+    const roomId = 'master-bedroom' as RoomId;
+    const bedroom: Room = {
+      room_id: roomId,
+      name: 'Master Bedroom',
+      device_ids: [
+        'master_bedroom_blake_lamp', 'master_bedroom_blake_lamp_2',
+        'master_bedroom_jinna_lamp', 'master_bedroom_jinna_lamp_2',
+      ] as CanonicalId[],
+    };
+    registry = makeRegistry([
+      device({ id: 'master_bedroom_blake_lamp', friendly_name: 'alpha lamp', room_id: roomId }),
+      device({ id: 'master_bedroom_blake_lamp_2', friendly_name: 'alpha lamp', room_id: roomId }),
+      device({ id: 'master_bedroom_jinna_lamp', friendly_name: 'beta lamp', room_id: roomId }),
+      device({ id: 'master_bedroom_jinna_lamp_2', friendly_name: 'beta lamp', room_id: roomId }),
+    ], [bedroom]);
+    gliner2.mode = 'room-lamps';
+    interpreter = new Interpreter({
+      registry,
+      gliner2,
+      bonsai,
+      room_lamp_entity_allowlist: new Set([
+        'light.master_bedroom_blake_lamp',
+        'light.master_bedroom_jinna_lamp',
+      ]),
+    });
+
+    const decision = await interpreter.interpret('please illuminate the Master Bedroom lamps', 'req-gliner-allowlisted-room-lamps');
+
+    expect(decision.outcome).toBe('ready_for_contract');
+    if (decision.outcome !== 'ready_for_contract') return;
+    expect(decision.proposal.target_phrases).toEqual(['alpha lamp', 'beta lamp']);
+    expect(decision.proposal.provenance.source).toBe('gliner2');
+    expect(bonsai.call_count).toBe(0);
+  });
+
+  it('grammar fail + grounded GLiNER2 partial + Bonsai success -> ready_for_contract', async () => {
     gliner2.mode = 'partial';
-    const decision = await interpreter.interpret('turn on the celestia lamp', 'req-i2');
+    const decision = await interpreter.interpret('please change the main lamp brightness', 'req-i2');
     expect(decision.outcome).toBe('ready_for_contract');
     if (decision.outcome !== 'ready_for_contract') return;
     expect(decision.proposal.provenance.source).toBe('composed-gliner2-bonsai');
+    expect(decision.proposal.unresolved_fields).toEqual([]);
     expect(gliner2.call_count).toBe(1);
+    expect(bonsai.call_count).toBe(1);
+  });
+
+  it('a GLiNER2 exclusion gap is retained unless Bonsai supplies an exclusion', async () => {
+    gliner2.mode = 'partial-exclusion';
+    const decision = await interpreter.interpret(
+      'turn on the living room lamp except the kitchen lights',
+      'req-i-exclusion-gap',
+    );
+    expect(decision.outcome).toBe('needs_clarification');
     expect(bonsai.call_count).toBe(1);
   });
 
@@ -222,17 +323,28 @@ describe('Interpreter', () => {
     expect(decision.candidates).toEqual([]);
   });
 
-  it('grammar fail + GLiNER2 unavailable + Bonsai success -> ready_for_contract (bonsai provenance)', async () => {
+  it('GLiNER2 unavailable + grounded Bonsai fallback -> ready_for_contract', async () => {
     const noGliner = new Interpreter({
       registry,
       gliner2: null,
       bonsai,
     });
-    const decision = await noGliner.interpret('turn on the celestia lamp', 'req-i4');
+    const decision = await noGliner.interpret('please alter the main lamp brightness', 'req-i4');
     expect(decision.outcome).toBe('ready_for_contract');
     if (decision.outcome !== 'ready_for_contract') return;
     expect(decision.proposal.provenance.source).toBe('bonsai');
     expect(bonsai.call_count).toBe(1);
+  });
+
+  it('rejects model guesses, compound actions, and unsupported dropped brightness', async () => {
+    for (const [utterance, requestId] of [
+      ['turn on Aardvark', 'req-ungrounded'],
+      ['turn on bedroom overhead and turn off main lamp', 'req-compound'],
+      ['turn on the bedroom fan and dim it', 'req-dropped-brightness'],
+    ] as const) {
+      const decision = await new Interpreter({ registry, gliner2: null, bonsai }).interpret(utterance, requestId);
+      expect(decision.outcome, utterance).toBe('needs_clarification');
+    }
   });
 
   it('grammar fail + GLiNER2 unavailable + Bonsai unavailable -> needs_clarification', async () => {

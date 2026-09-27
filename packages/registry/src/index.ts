@@ -121,7 +121,12 @@ export class RegistryOverlay {
       const idMatch = d.canonical_id === phrase;
       const aliasMatch = d.aliases.some((a) => a.toLowerCase() === normalized);
       const friendlyExact = d.friendly_name.toLowerCase() === normalized;
-      const friendlySubstring = wordBoundaryContains(d.friendly_name.toLowerCase(), normalized);
+      // A bare device-type token must not select whichever friendly name
+      // happens to contain that word (for example, "lights" selecting only
+      // a device named "Kitchen Lights" in a multi-room home). Explicit
+      // aliases and full friendly names still resolve above.
+      const friendlySubstring = !GENERIC_DEVICE_WORDS.has(normalized)
+        && wordBoundaryContains(d.friendly_name.toLowerCase(), normalized);
 
       if (idMatch || aliasMatch || friendlyExact || friendlySubstring) {
         const key = String(d.canonical_id);
@@ -196,6 +201,10 @@ export class RegistryOverlay {
     });
   }
 }
+
+const GENERIC_DEVICE_WORDS = new Set([
+  'light', 'lights', 'lamp', 'lamps', 'switch', 'switches', 'fan', 'fans', 'device', 'devices',
+]);
 
 // =============================================================================
 // Helpers

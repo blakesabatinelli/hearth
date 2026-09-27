@@ -35,21 +35,21 @@ deployment on the operator's Mac.
    real sidecar when set.
 
 4. **OpenClaw adapter (item 5).** New `packages/openclaw-adapter/`
-   package. `OpenClawBonsaiProvider` is an HTTP client for the
-   OpenClaw external Gateway that runs locally and never sees
-   household credentials or any actuation tools. Hard constraints:
+   package. `OpenClawBonsaiProvider` uses the pinned OpenClaw Gateway
+   WebSocket client and never receives household credentials or any
+   actuation tools. Hard constraints:
    `assertLoopbackOnly()` refuses any URL that doesn't resolve to
    `127.0.0.1`, `localhost`, or `::1`; bearer auth is required; the
    adapter's `validateProposal()` is server-side strict validation
    that throws `ProposalValidationError` on the first failure (never
-   silent repair); one retry max on transient 5xx; pin enforcement
-   rejects responses that don't report `openclaw_pin=2026.9.6`.
+   silent repair); accepted agent runs are never resubmitted; the
+   Gateway version is checked against `2026.9.6` during the handshake.
 
 5. **`BonsaiProvider` through that adapter (item 6).** Same class
    implements `BonsaiProvider.propose()` and `validateProposal()`.
-   Strict JSON-Schema (`PROPOSAL_JSON_SCHEMA`, version `0.0.1`) is
-   sent to the model. Invalid output -> `ProposalValidationError`,
-   the interpreter falls back to clarification. `main.ts` wires this
+   The model receives a compact output contract and Hearth performs
+   strict validation against schema version `0.0.1`. Invalid output
+   throws `ProposalValidationError`; `main.ts` wires this
    via `resolveBonsaiProvider()`; if `HEARTH_OPENCLAW_URL` and
    `HEARTH_GATEWAY_TOKEN` are unset, the bonsai slot stays null and
    the interpreter routes through grammar + GLiNER2 only.
@@ -67,19 +67,19 @@ deployment on the operator's Mac.
 
 7. **Doctor checks for live resources (item 8).** `doctor()` adds
    two checks: `ha-reachable` (live-mode `/api/` probe with bearer
-   token) and `openclaw-reachable` (loopback guard + token guard +
-   `/agent/turn` probe). Both fail closed if the live resource is
+   token) and `openclaw-reachable` (loopback-only, authenticated
+   Gateway WebSocket handshake). Both fail closed if the live resource is
    unreachable in live mode. The Doctor CLI now reports a third
    dimension to its summary: 6 pass in fully-live mode, 5 pass in
    fixture mode.
 
 8. **Stage 0 round-trip (item 9).** New
-   `apps/control/tests/round-trip.test.ts` exercises the full chain
-   against an in-process HTTP server pretending to be OpenClaw.
+   `apps/control/tests/round-trip.test.ts` exercises the adapter
+   against a fake Gateway RPC client.
    The tests verify that `propose() -> validateProposal() ->
-   IntentProposal` round-trips correctly with the happy path, the
-   one-5xx retry, and the no-silent-repair-on-invalid path. Item 9
-   is now exercised end-to-end.
+   IntentProposal` round-trips correctly with the happy path,
+   request idempotency, no resubmission after acceptance, and the
+   no-silent-repair-on-invalid path. Item 9 is exercised end-to-end.
 
 ### Items still owed
 
