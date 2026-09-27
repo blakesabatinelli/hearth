@@ -40,6 +40,14 @@ import {
 
 const DEFAULT_EXPIRY_SECONDS = 30;
 const MAX_EXPIRY_SECONDS = 600;
+const EXECUTABLE_LOAD_TYPES = new Set<DeviceRecord['load_type']>(['light', 'fan']);
+
+export class UnsafeProposalError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'UnsafeProposalError';
+  }
+}
 
 function defaultPolicy(role: ActorRole): EvidencePolicy {
   if (role === 'wall-tablet' || role === 'service') {
@@ -111,6 +119,15 @@ export async function buildContract(
     expiry_seconds,
   } = input;
 
+  if (proposal.unresolved_fields.length > 0) {
+    throw new UnsafeProposalError(
+      `proposal has unresolved fields: ${proposal.unresolved_fields.join(', ')}`,
+    );
+  }
+  if (!['set-state', 'set-brightness-absolute', 'set-brightness-relative', 'set-scene'].includes(proposal.intent_family)) {
+    throw new UnsafeProposalError(`intent family ${proposal.intent_family} requires its dedicated scheduler or query path`);
+  }
+
   const expiry =
     typeof expiry_seconds === 'number' && Number.isFinite(expiry_seconds)
       ? Math.min(MAX_EXPIRY_SECONDS, Math.max(1, Math.floor(expiry_seconds)))
@@ -133,7 +150,10 @@ export async function buildContract(
         },
       );
     }
-    if (matches.length > 1) {
+    const safe_all_off_expansion = phrase.trim().toLocaleLowerCase() === 'everything'
+      && proposal.intent_family === 'set-state'
+      && proposal.desired_values.on === false;
+    if (matches.length > 1 && !safe_all_off_expansion) {
       throw new StaleContextError(
         `ambiguous target phrase "${phrase}" -> ${matches.length} devices`,
         {
@@ -143,46 +163,82 @@ export async function buildContract(
         },
       );
     }
-    const dev = registry.getDevice(matches[0]!.canonical_id);
-    if (!dev) {
-      throw new StaleContextError(
-        `registry has no record for ${matches[0]!.canonical_id}`,
-        {
-          canonical_id: matches[0]!.canonical_id,
-          expected_state_version: -1,
-          actual_state_version: -1,
-        },
-      );
+    for (const match of matches) {
+      const dev = registry.getDevice(match.canonical_id);
+      if (!dev) {
+        throw new StaleContextError(
+          `registry has no record for ${match.canonical_id}`,
+          {
+            canonical_id: match.canonical_id,
+            expected_state_version: -1,
+            actual_state_version: -1,
+          },
+        );
+      }
+      if (!EXECUTABLE_LOAD_TYPES.has(dev.load_type)) {
+        throw new UnsafeProposalError(`load type ${dev.load_type} is not enabled for actuation`);
+      }
+      if ((proposal.intent_family === 'set-brightness-absolute' || proposal.intent_family === 'set-brightness-relative')
+        && (dev.load_type !== 'light' || !dev.capabilities.includes('brightness'))) {
+        throw new UnsafeProposalError(`brightness is not a supported capability for ${dev.canonical_id}`);
+      }
+      if (proposal.intent_family === 'set-scene' && !dev.capabilities.includes('scene')) {
+        throw new UnsafeProposalError(`scene control is not a supported capability for ${dev.canonical_id}`);
+      }
+      if (!dev.allowed_actors.includes(actor.role as DeviceRecord['allowed_actors'][number])) {
+        throw new StaleContextError(
+          `actor role ${actor.role} not allowed on ${dev.canonical_id}`,
+          {
+            canonical_id: dev.canonical_id,
+            expected_state_version: -1,
+            actual_state_version: -1,
+          },
+        );
+      }
+      // v3.0.1: snapshot the device's state_version + attributes at build
+      // time so the executor's stale-context check at dispatch time has a
+      // real comparison value (was hard-coded to 0 in v3.0).
+      let state_version = 0;
+      let attributes: Readonly<Record<string, unknown>> = {};
+      if (input.observed_state) {
+        state_version = await input.observed_state(dev.canonical_id);
+      }
+      resolved.push({
+        canonical_id: dev.canonical_id,
+        load_type: dev.load_type,
+        route: dev.route_preference,
+        state_version,
+        attributes,
+      });
     }
-    if (!dev.allowed_actors.includes(actor.role as DeviceRecord['allowed_actors'][number])) {
-      throw new StaleContextError(
-        `actor role ${actor.role} not allowed on ${dev.canonical_id}`,
-        {
-          canonical_id: dev.canonical_id,
-          expected_state_version: -1,
-          actual_state_version: -1,
-        },
-      );
-    }
-    // v3.0.1: snapshot the device's state_version + attributes at build
-    // time so the executor's stale-context check at dispatch time has a
-    // real comparison value (was hard-coded to 0 in v3.0).
-    let state_version = 0;
-    let attributes: Readonly<Record<string, unknown>> = {};
-    if (input.observed_state) {
-      state_version = await input.observed_state(dev.canonical_id);
-    }
-    resolved.push({
-      canonical_id: dev.canonical_id,
-      load_type: dev.load_type,
-      route: dev.route_preference,
-      state_version,
-      attributes,
-    });
   }
 
-  // Build contract targets.
-  const targets: ContractTarget[] = resolved.map((r) => ({
+  // Resolve exclusions to the same canonical IDs used by executable
+  // targets. Keeping only the phrase in the contract is insufficient:
+  // the executor's target list is authoritative for dispatch.
+  const excluded_canonical_ids = new Set<CanonicalId>();
+  for (const phrase of proposal.exclusions) {
+    const matches = await resolve_phrase(phrase);
+    if (matches.length === 0) {
+      throw new UnsafeProposalError(`unresolved exclusion phrase "${phrase}"`);
+    }
+    for (const match of matches) excluded_canonical_ids.add(match.canonical_id);
+  }
+
+  const excluded_outside_request = [...excluded_canonical_ids].filter(
+    (canonical_id) => !resolved.some((target) => target.canonical_id === canonical_id),
+  );
+  if (excluded_outside_request.length > 0) {
+    throw new UnsafeProposalError('exclusion does not match any requested target');
+  }
+
+  const included = resolved.filter((target) => !excluded_canonical_ids.has(target.canonical_id));
+  if (included.length === 0) {
+    throw new UnsafeProposalError('exclusions remove every executable target');
+  }
+
+  // Build contract targets only after exclusions are applied.
+  const targets: ContractTarget[] = included.map((r) => ({
     canonical_id: r.canonical_id,
     load_type: r.load_type,
     route: r.route,
@@ -194,7 +250,7 @@ export async function buildContract(
   let resolved_desired: Readonly<Record<string, number | string | boolean>> = proposal.desired_values;
   if (input.resolve_relative && (proposal.intent_family === 'set-brightness-relative' || hasRelativeKeys(proposal.desired_values))) {
     const out: Record<string, number | string | boolean> = {};
-    for (const r of resolved) {
+    for (const r of included) {
       const absolute = await input.resolve_relative(r.canonical_id, proposal.desired_values, r.attributes);
       Object.assign(out, absolute);
     }
@@ -211,13 +267,6 @@ export async function buildContract(
   const policy = defaultPolicy(actor.role);
   for (const t of targets) {
     per_target_evidence[t.canonical_id] = policy;
-  }
-
-  // Resolve exclusions: phrases -> canonical IDs. Fail closed.
-  const excluded_canonical_ids: CanonicalId[] = [];
-  for (const phrase of proposal.exclusions) {
-    const matches = await resolve_phrase(phrase);
-    for (const m of matches) excluded_canonical_ids.push(m.canonical_id);
   }
 
   const preconditions: Precondition[] = [];

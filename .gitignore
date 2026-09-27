@@ -2,6 +2,9 @@
 node_modules/
 .pnpm-store/
 **/node_modules/
+**/.venv/
+**/__pycache__/
+**/*.egg-info/
 
 # Build outputs
 dist/

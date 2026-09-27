@@ -66,7 +66,19 @@ export type Capability =
   | 'scene';
 
 export type ProviderId =
-  | { readonly kind: 'ha'; readonly entity_id: string }
+  | {
+      readonly kind: 'ha';
+      readonly entity_id: string;
+      /** Home Assistant device registry ID, grouping its physical entities. */
+      readonly device_id?: string;
+      /** Integration and registry fields used for local device review. */
+      readonly platform?: string;
+      readonly unique_id?: string;
+      readonly entity_category?: string | null;
+      readonly device_name?: string | null;
+      readonly manufacturer?: string | null;
+      readonly model?: string | null;
+    }
   | { readonly kind: 'hue'; readonly hue_id: string }
   | { readonly kind: 'smartthings'; readonly device_id: string }
   | { readonly kind: 'alexa'; readonly device_id: string }

@@ -22,7 +22,7 @@ import {
   StaleContextError,
   contractPayloadHash,
 } from '../src/index.js';
-import type { CanonicalId } from '@hearth/contracts';
+import type { CanonicalId, HomeAssistantAdapter } from '@hearth/contracts';
 import Database from 'better-sqlite3';
 
 const LAMP = asCanonical('light.kitchen_lamp');
@@ -54,6 +54,32 @@ describe('ContractExecutor - no-op', () => {
       desired_values: { on: true },
     });
     const receipt = await executor.dispatch(contract);
+    expect(receipt.per_target[LAMP]?.kind).toBe('already-satisfied');
+    expect(receipt.aggregate).toBe('no-op');
+    expect(adapter.dispatched).toHaveLength(0);
+  });
+
+  it('waits for a fresh state poll before dispatching an already-satisfied command', async () => {
+    const { adapter, clock, store, registry } = harness();
+    adapter.setState(LAMP, { on: true });
+    const delayedAdapter: HomeAssistantAdapter = {
+      listDevices: () => adapter.listDevices(),
+      listRooms: () => adapter.listRooms(),
+      getState: async (canonical_id) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return adapter.getState(canonical_id);
+      },
+      dispatch: (target, desired_values) => adapter.dispatch(target, desired_values),
+      subscribe: (canonical_ids, handler) => adapter.subscribe(canonical_ids, handler),
+    };
+    const executor = new ContractExecutor({ adapter: delayedAdapter, registry, store, clock });
+    const contract = makeContract({
+      targets: [makeTarget(LAMP)],
+      desired_values: { on: true },
+    });
+
+    const receipt = await executor.dispatch(contract);
+
     expect(receipt.per_target[LAMP]?.kind).toBe('already-satisfied');
     expect(receipt.aggregate).toBe('no-op');
     expect(adapter.dispatched).toHaveLength(0);
@@ -251,7 +277,7 @@ describe('ContractExecutor - evidence policy', () => {
     expect(receipt.aggregate).toBe('sent-unconfirmed');
   });
 
-  it('failed when accept_optimistic is false and no fresh observation arrives', async () => {
+  it('keeps an unconfirmed sent command uncertain when optimistic evidence is disabled', async () => {
     const { executor, adapter } = harness();
     adapter.suppressAutoStateOnDispatch = true;
     adapter.setState(LAMP, { on: false });
@@ -262,11 +288,38 @@ describe('ContractExecutor - evidence policy', () => {
     });
     const receipt = await executor.dispatch(contract);
     const outcome = receipt.per_target[LAMP];
-    expect(outcome?.kind).toBe('failed');
-    if (outcome?.kind === 'failed') {
-      expect(outcome.error.code).toBe('provider-error');
-    }
-    expect(receipt.aggregate).toBe('failed');
+    expect(outcome?.kind).toBe('unknown-after-failure');
+    expect(receipt.aggregate).toBe('sent-unconfirmed');
+  });
+
+  it('confirms a delayed state change by polling when no websocket event arrives', async () => {
+    const { adapter, clock, store, registry } = harness();
+    adapter.setState(LAMP, { on: false });
+    adapter.suppressAutoStateOnDispatch = true;
+    const pollingAdapter: HomeAssistantAdapter = {
+      listDevices: () => adapter.listDevices(),
+      listRooms: () => adapter.listRooms(),
+      getState: (canonical_id) => adapter.getState(canonical_id),
+      dispatch: async (target, desired_values) => {
+        const ack = await adapter.dispatch(target, desired_values);
+        setTimeout(() => adapter.setState(target.canonical_id, { ...desired_values }), 25);
+        return ack;
+      },
+      subscribe: () => ({ unsubscribe: () => undefined }),
+    };
+    const executor = new ContractExecutor({ adapter: pollingAdapter, registry, store, clock });
+    const contract = makeContract({
+      targets: [makeTarget(LAMP)],
+      desired_values: { on: true },
+      per_target_evidence: {
+        [LAMP]: evidencePolicy({ require_fresh_observation_ms: 300, accept_optimistic: false }),
+      },
+    });
+
+    const receipt = await executor.dispatch(contract);
+
+    expect(receipt.per_target[LAMP]?.kind).toBe('observed-after-command');
+    expect(receipt.aggregate).toBe('confirmed');
   });
 });
 
@@ -435,7 +488,7 @@ describe('ContractExecutor - per-target outcome taxonomy', () => {
     expect(receipt.aggregate).toBe('no-op');
   });
 
-  it('unknown-after-failure is recorded when recovery cannot determine state', async () => {
+  it('retries an idempotent set-state command when a fresh poll shows the goal is still absent', async () => {
     const { executor, adapter, store } = harness();
     // An interrupted contract whose getState returns an observation that does
     // NOT match the goal -> unknown-after-failure (recovery then retries).
@@ -455,6 +508,82 @@ describe('ContractExecutor - per-target outcome taxonomy', () => {
     // The aggregate after retry should be confirmed (the fake ack returns
     // sent and the post-retry state matches).
     expect(adapter.dispatched.length).toBeGreaterThan(0);
+  });
+
+  it('does not replay an interrupted command when the state observation is stale', async () => {
+    const { adapter, clock, store, registry } = harness();
+    adapter.setState(LAMP, { on: false }, { observed_at: '2026-09-24T11:00:00.000Z' });
+    const staleAdapter: HomeAssistantAdapter = {
+      listDevices: () => adapter.listDevices(),
+      listRooms: () => adapter.listRooms(),
+      getState: (canonical_id) => adapter.getState(canonical_id),
+      dispatch: (target, desired_values) => adapter.dispatch(target, desired_values),
+      subscribe: (canonical_ids, handler) => adapter.subscribe(canonical_ids, handler),
+    };
+    const executor = new ContractExecutor({ adapter: staleAdapter, registry, store, clock });
+    const contract = makeContract({
+      contract_id: 'c-stale-restart',
+      request_id: 'r-stale-restart',
+      targets: [makeTarget(LAMP)],
+      desired_values: { on: true },
+      per_target_evidence: { [LAMP]: evidencePolicy({ require_fresh_observation_ms: 5_000 }) },
+      status: 'dispatching',
+    });
+    store.saveContract(contract, contractPayloadHash(contract));
+
+    const recovered = await executor.reconcileOnStartup();
+
+    expect(adapter.dispatched).toHaveLength(0);
+    expect(recovered[0]?.aggregate).toBe('sent-unconfirmed');
+    expect(recovered[0]?.per_target[LAMP]?.kind).toBe('unknown-after-failure');
+    expect(store.getContract(contract.contract_id)?.status).toBe('sent-unconfirmed');
+  });
+
+  it('does not replay an interrupted command when the provider cannot observe state', async () => {
+    const { adapter, clock, store, registry } = harness();
+    adapter.setState(LAMP, { on: false });
+    const unavailableAdapter: HomeAssistantAdapter = {
+      listDevices: () => adapter.listDevices(),
+      listRooms: () => adapter.listRooms(),
+      getState: async () => { throw new Error('state read unavailable'); },
+      dispatch: (target, desired_values) => adapter.dispatch(target, desired_values),
+      subscribe: (canonical_ids, handler) => adapter.subscribe(canonical_ids, handler),
+    };
+    const executor = new ContractExecutor({ adapter: unavailableAdapter, registry, store, clock });
+    const contract = makeContract({
+      contract_id: 'c-unavailable-restart',
+      request_id: 'r-unavailable-restart',
+      targets: [makeTarget(LAMP)],
+      desired_values: { on: true },
+      status: 'dispatching',
+    });
+    store.saveContract(contract, contractPayloadHash(contract));
+
+    const recovered = await executor.reconcileOnStartup();
+
+    expect(adapter.dispatched).toHaveLength(0);
+    expect(recovered[0]?.aggregate).toBe('sent-unconfirmed');
+    expect(recovered[0]?.per_target[LAMP]?.kind).toBe('unknown-after-failure');
+    expect(store.getContract(contract.contract_id)?.status).toBe('sent-unconfirmed');
+  });
+
+  it('does not replay when a fresh observation omits the command state field', async () => {
+    const { executor, adapter, store } = harness();
+    adapter.setState(LAMP, {});
+    const contract = makeContract({
+      contract_id: 'c-incomplete-restart',
+      request_id: 'r-incomplete-restart',
+      targets: [makeTarget(LAMP)],
+      desired_values: { on: true },
+      status: 'dispatching',
+    });
+    store.saveContract(contract, contractPayloadHash(contract));
+
+    const recovered = await executor.reconcileOnStartup();
+
+    expect(adapter.dispatched).toHaveLength(0);
+    expect(recovered[0]?.aggregate).toBe('sent-unconfirmed');
+    expect(recovered[0]?.per_target[LAMP]?.kind).toBe('unknown-after-failure');
   });
 });
 

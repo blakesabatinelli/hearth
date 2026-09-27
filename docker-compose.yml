@@ -57,7 +57,7 @@ services:
       HEARTH_EXTRACT_URL: "http://hearth-extract:8765"
       NODE_ENV: "production"
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     volumes:
       - hearth_db:/data
       - hearth_cfg:/config
@@ -79,11 +79,12 @@ services:
     build:
       context: .
       target: runtime
-    command: ["npx", "--yes", "serve", "-s", "apps/web/dist", "-l", "5173"]
+    command: ["pnpm", "--filter", "@hearth/web", "exec", "vite", "--host", "0.0.0.0", "--port", "5173"]
     environment:
       NODE_ENV: "production"
+      HEARTH_CONTROL_PROXY_URL: "http://hearth-control:8787"
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     networks: [hearth]
     depends_on:
       - hearth-control

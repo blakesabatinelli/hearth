@@ -11,6 +11,7 @@ import {
   ContractStatusError,
 } from '@hearth/executor';
 import { ForbiddenFieldError } from '@hearth/interpreter';
+import { UnsafeProposalError } from './contract-builder.js';
 
 export type ApiErrorBody = {
   readonly error: {
@@ -23,6 +24,17 @@ export type ApiErrorBody = {
 export type ApiError = { readonly status: number; readonly body: ApiErrorBody };
 
 export function mapDomainError(err: unknown): ApiError {
+  if (err instanceof UnsafeProposalError) {
+    return {
+      status: 422,
+      body: {
+        error: {
+          code: 'unsafe_proposal',
+          message: err.message,
+        },
+      },
+    };
+  }
   if (err instanceof IdempotencyConflictError) {
     return {
       status: 409,

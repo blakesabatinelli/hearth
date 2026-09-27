@@ -115,9 +115,10 @@ async def extract(req: ExtractRequest) -> dict:
     # raises TypeError against the pinned v2.0.0 release.
     schema = {
         "entities": req.schema_in.entity_types,
-        "classifications": [
-            {"task": label, "labels": [label]} for label in req.schema_in.classification_labels
-        ],
+        "classifications": [{
+            "task": "intent",
+            "labels": req.schema_in.classification_labels,
+        }],
         "relations": req.schema_in.relations,
     }
     try:
@@ -125,6 +126,7 @@ async def extract(req: ExtractRequest) -> dict:
             req.utterance,
             schema=schema,
             threshold=0.5,
+            include_confidence=True,
         )
     except TypeError as e:
         # Fallback: some legacy checkpoints still expose
@@ -142,16 +144,84 @@ async def extract(req: ExtractRequest) -> dict:
     except Exception as e:
         log.exception("gliner2 extract failed")
         raise HTTPException(status_code=500, detail=f"extract failed: {e}") from e
-    # Return shape compatible with ExtractionResult.
+    entities, entity_confidences = _normalize_entities(result.get("entities", {}))
+    classifications, intent_confidences = _normalize_classification(
+        result.get("intent"), req.utterance, req.schema_in.classification_labels
+    )
+    unresolved = list(result.get("unresolved", []))
+    if not classifications and "intent" not in unresolved:
+        unresolved.append("intent")
+    confidences = [*entity_confidences, *intent_confidences]
+    confidence = min(confidences) if confidences else 0.0
+
+    # Return the contract shape. GLiNER2 v2 returns each classification
+    # under its task name and entities as attributed span objects when
+    # include_confidence=True; neither shape matches ExtractionResult.
     return {
         "request_id": req.request_id,
-        "entities": result.get("entities", {}),
-        "classifications": result.get("classifications", []),
+        "entities": entities,
+        "classifications": classifications,
         "relations": result.get("relations", []),
-        "unresolved": result.get("unresolved", []),
-        "confidence": float(result.get("confidence", 0.0)),
+        "unresolved": unresolved,
+        "confidence": confidence,
         "original_utterance": req.utterance,
     }
+
+
+def _normalize_entities(raw_entities: object) -> tuple[dict[str, list[str]], list[float]]:
+    if not isinstance(raw_entities, dict):
+        return {}, []
+    entities: dict[str, list[str]] = {}
+    confidences: list[float] = []
+    for name, raw_spans in raw_entities.items():
+        spans = raw_spans if isinstance(raw_spans, list) else [raw_spans]
+        normalized: list[str] = []
+        for span in spans:
+            if isinstance(span, str):
+                text = span
+            elif isinstance(span, dict):
+                text = span.get("text", "")
+                score = span.get("confidence")
+                if isinstance(score, (int, float)):
+                    confidences.append(float(score))
+            elif isinstance(span, tuple) and span:
+                text = span[0]
+                if len(span) > 1 and isinstance(span[1], (int, float)):
+                    confidences.append(float(span[1]))
+            else:
+                continue
+            if isinstance(text, str) and text.strip() and text not in normalized:
+                normalized.append(text.strip())
+        entities[str(name)] = normalized
+    return entities, confidences
+
+
+def _normalize_classification(
+    raw_intent: object,
+    utterance: str,
+    allowed_labels: list[str],
+) -> tuple[list[dict[str, str]], list[float]]:
+    if raw_intent is None:
+        return [], []
+    choices = raw_intent if isinstance(raw_intent, list) else [raw_intent]
+    normalized: list[dict[str, str]] = []
+    confidences: list[float] = []
+    for choice in choices:
+        if isinstance(choice, dict):
+            label = choice.get("label")
+            score = choice.get("confidence")
+        else:
+            label = choice
+            score = None
+        if isinstance(label, str) and label in allowed_labels:
+            normalized.append({"label": label, "span": utterance})
+            if isinstance(score, (int, float)):
+                confidences.append(float(score))
+    # A classification task is single-label. Multiple returned labels are
+    # ambiguous and must not be converted into an executable proposal.
+    if len(normalized) != 1:
+        return [], confidences
+    return normalized, confidences
 
 
 def main() -> None:

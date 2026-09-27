@@ -4,6 +4,10 @@ import { getApi, type HearthApi, type SessionInfo } from './api';
 import { Home } from './screens/Home';
 import { Ask } from './screens/Ask';
 import { History } from './screens/History';
+import { Overview } from './screens/Overview';
+import { Attention } from './screens/Attention';
+import { Devices } from './screens/Devices';
+import { Routines } from './screens/Routines';
 
 type SessionState =
   | { readonly kind: 'loading' }
@@ -51,12 +55,17 @@ export function App(): React.ReactElement {
             <strong>session error:</strong> {session.message}
           </div>
         )}
-        {session.kind === 'ready' && route === 'home' && <Home api={api.current} />}
+        {session.kind === 'ready' && route === 'home' && <Overview api={api.current} />}
+        {session.kind === 'ready' && route === 'rooms' && <Home api={api.current} title="Rooms" />}
+        {session.kind === 'ready' && route === 'favorites' && <Home api={api.current} title="Favorites" favoritesOnly />}
         {session.kind === 'ready' && route === 'ask' && <Ask api={api.current} />}
-        {session.kind === 'ready' && route === 'history' && <History />}
+        {session.kind === 'ready' && route === 'routines' && <Routines api={api.current} />}
+        {session.kind === 'ready' && route === 'attention' && <Attention api={api.current} />}
+        {session.kind === 'ready' && route === 'history' && <History api={api.current} />}
+        {session.kind === 'ready' && route === 'devices' && <Devices api={api.current} />}
       </main>
       <footer className="hearth-footer">
-        <small>Hearth PWA - Stage 4 skeleton</small>
+        <small>Hearth home control</small>
       </footer>
     </div>
   );
@@ -67,6 +76,7 @@ function Nav({ route }: { readonly route: RouteName }): React.ReactElement {
     <a
       href={name === 'home' ? '#/' : `#/${name}`}
       className={route === name ? 'nav-link active' : 'nav-link'}
+      aria-current={route === name ? 'page' : undefined}
       data-testid={`nav-${name}`}
     >
       {label}
@@ -75,8 +85,13 @@ function Nav({ route }: { readonly route: RouteName }): React.ReactElement {
   return (
     <nav className="hearth-nav" aria-label="primary">
       {link('home', 'Home')}
+      {link('rooms', 'Rooms')}
+      {link('favorites', 'Favorites')}
       {link('ask', 'Ask')}
+      {link('routines', 'Routines')}
+      {link('attention', 'Attention')}
       {link('history', 'History')}
+      {link('devices', 'Devices')}
     </nav>
   );
 }

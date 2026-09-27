@@ -2,9 +2,9 @@
 
 An installable home management system. PWA front end + independent TypeScript control service + pinned OpenClaw conversational runtime + local Bonsai 27B language model.
 
-**Status:** Stage 0 (Repository and compatibility spike). No release yet. See `STATE.md`.
+**Status:** Stage 0 is verified. Stage 1 fixture and Stage 3 synthetic corpus gates pass. The household host is live, with two verified lamp entities enabled; full device review and iPad remote access remain in progress. No release yet. See `STATE.md` and `docs/gates.md`.
 
-**Plan:** `HEARTH_HERMES_DEVELOPMENT_PLAN.md` v3.0.
+**Current plan:** `docs/plan-ipad-full-activation.md`.
 
 **How to work this repo:** read `AGENTS.md` first.
 
@@ -30,7 +30,7 @@ cd hearth
 sed -n '1,240p' docs/macos-host-setup.md
 ```
 
-This repository is still at Stage 0. The checked-in application runs in fixture mode, and the setup guide does not claim that the current revision provides a complete live-device integration.
+The checked-in application defaults to fixture mode for safe development. Live Home Assistant mode is available on the setup host and remains fail-closed behind an exact per-entity executor allowlist. Do not treat discovery as permission to actuate a device.
 
 ## Architecture
 
@@ -64,12 +64,12 @@ packages/contracts/ shared types (contract, receipt, intent proposal, extraction
 packages/registry/  canonical device identity + overlay
 packages/interpreter/ grammar-first parser + GLiNER2/Bonsai fallback resolver
 packages/executor/  executor + per-target evidence + receipts
-packages/routines/  durable scheduler
+packages/scheduler/  durable scheduler and persisted routines
 packages/ha-adapter/  fake-HA default, real HA by config
 packages/discovery/   LAN + hub + account importers + coverage report
 packages/openclaw-adapter/ restricted adapter into pinned OpenClaw
 packages/extractor/   TypeScript-side adapter for the hearth-extract sidecar
-packages/cli/         install / configure / doctor / backup / upgrade / rollback / uninstall
+scripts/              install, upgrade, rollback, diagnostics, and evaluation tools
 ```
 
 ## Layout conventions
@@ -80,7 +80,7 @@ packages/cli/         install / configure / doctor / backup / upgrade / rollback
 
 ## Bonsai + GLiNER2 model locks
 
-`models/bonsai.lock.json` pins the Bonsai 27B reasoning model. Real weights are deferred to the deployment machine; the `mock-bonsai` adapter stands in until they are available.
+`models/bonsai.lock.json` describes the Bonsai 27B reasoning model. The setup host has local GGUF weights and a running llama.cpp server behind the OpenClaw provider. Release-grade source, build, memory, and checksum metadata are still incomplete.
 
 `models/gliner2.lock.json` pins the GLiNER2 extractor (v2.0.0, Apache-2.0). GLiNER2 is the first model used for natural-language requests (ADR-2026-09-24-gliner2-required). It runs in a separate `hearth-extract` Python sidecar; hearth-control calls over a local socket.
 

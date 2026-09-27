@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const controlProxyUrl = process.env['HEARTH_CONTROL_PROXY_URL'] ?? 'http://127.0.0.1:8787';
+
 // PWA dev/build config.
 //
 // The backend (apps/control) listens on http://127.0.0.1:8787 and does NOT
@@ -18,15 +20,15 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/v1': {
-        target: 'http://127.0.0.1:8787',
+        target: controlProxyUrl,
         changeOrigin: true,
       },
       '/healthz': {
-        target: 'http://127.0.0.1:8787',
+        target: controlProxyUrl,
         changeOrigin: true,
       },
       '/readyz': {
-        target: 'http://127.0.0.1:8787',
+        target: controlProxyUrl,
         changeOrigin: true,
       },
     },

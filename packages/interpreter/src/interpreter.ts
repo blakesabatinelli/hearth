@@ -66,6 +66,11 @@ export type InterpreterOptions = {
    * ready_for_contract. Defaults to 0.7 per the spec.
    */
   readonly gliner2_confidence_threshold?: number;
+  /**
+   * In live mode, constrain room-wide lamp expansion to exact HA entities
+   * approved by the local executor allowlist. Omitted only in fixture mode.
+   */
+  readonly room_lamp_entity_allowlist?: ReadonlySet<string>;
 };
 
 export type InterpreterInterpretOptions = {
@@ -114,6 +119,7 @@ export class Interpreter {
   private readonly bonsai: BonsaiProvider | null;
   private readonly recent_fresh_state: () => ReadonlyArray<StateObservation>;
   private readonly gliner2_confidence_threshold: number;
+  private readonly room_lamp_entity_allowlist: ReadonlySet<string> | undefined;
   private readonly grammar: GrammarParser;
 
   public constructor(opts: InterpreterOptions) {
@@ -125,7 +131,13 @@ export class Interpreter {
     this.bonsai = opts.bonsai;
     this.recent_fresh_state = opts.recent_fresh_state ?? (() => []);
     this.gliner2_confidence_threshold = opts.gliner2_confidence_threshold ?? 0.7;
-    this.grammar = new GrammarParser({ registry: opts.registry });
+    this.room_lamp_entity_allowlist = opts.room_lamp_entity_allowlist;
+    this.grammar = new GrammarParser({
+      registry: opts.registry,
+      ...(opts.room_lamp_entity_allowlist !== undefined
+        ? { room_lamp_entity_allowlist: opts.room_lamp_entity_allowlist }
+        : {}),
+    });
   }
 
   /**
@@ -161,9 +173,15 @@ export class Interpreter {
     if (this.gliner2 !== null) {
       try {
         const extraction = await this.gliner2.extract({ request_id, utterance, schema });
-        const proposal = this.tryGliner2ToProposal(extraction, request_id);
+        const proposal = await this.tryGliner2ToProposal(extraction, request_id);
         if (proposal !== null) {
-          return { outcome: 'ready_for_contract', proposal };
+          return await this.isSafeFallbackProposal(utterance, proposal)
+            ? { outcome: 'ready_for_contract', proposal }
+            : {
+              outcome: 'needs_clarification',
+              reason: 'model interpretation was not grounded in the request or omitted a constraint',
+              candidates: [],
+            };
         }
         // Extraction incomplete. If Bonsai is configured, hand the
         // partial to Bonsai and produce a composed proposal; otherwise
@@ -177,6 +195,13 @@ export class Interpreter {
             });
             // Compose: prepend gliner2's checkpoint_id to provenance.
             const composed = composeProvenance(bonsaiProposal, extraction);
+            if (!await this.isSafeFallbackProposal(utterance, composed)) {
+              return {
+                outcome: 'needs_clarification',
+                reason: 'model interpretation was not grounded in the request or omitted a constraint',
+                candidates: [],
+              };
+            }
             return { outcome: 'ready_for_contract', proposal: composed };
           } catch (err) {
             return {
@@ -201,6 +226,13 @@ export class Interpreter {
               utterance,
               context: this.buildProposalContext(),
             });
+            if (!await this.isSafeFallbackProposal(utterance, bonsaiProposal)) {
+              return {
+                outcome: 'needs_clarification',
+                reason: 'model interpretation was not grounded in the request or omitted a constraint',
+                candidates: [],
+              };
+            }
             return { outcome: 'ready_for_contract', proposal: bonsaiProposal };
           } catch (err2) {
             return {
@@ -226,6 +258,13 @@ export class Interpreter {
           utterance,
           context: this.buildProposalContext(),
         });
+        if (!await this.isSafeFallbackProposal(utterance, proposal)) {
+          return {
+            outcome: 'needs_clarification',
+            reason: 'model interpretation was not grounded in the request or omitted a constraint',
+            candidates: [],
+          };
+        }
         return { outcome: 'ready_for_contract', proposal };
       } catch (err) {
         return {
@@ -274,31 +313,38 @@ export class Interpreter {
    * when the extraction is incomplete (target missing, intent family
    * missing, low confidence, etc.).
    */
-  private tryGliner2ToProposal(
+  private async tryGliner2ToProposal(
     extraction: ExtractionResult,
     request_id: string,
-  ): IntentProposal | null {
+  ): Promise<IntentProposal | null> {
     if (extraction.confidence < this.gliner2_confidence_threshold) {
       return null;
     }
-    if (extraction.unresolved.length > 0) {
-      // Honest about the gap: surface the unresolved items in the
-      // proposal so the resolver can decide.
-    }
+    if (extraction.unresolved.length > 0) return null;
     const entities = extraction.entities;
     const device_targets = entities['device_target'] ?? [];
+    const rooms = entities['room'] ?? [];
     const exclusions = entities['exclusion'] ?? [];
     const times = entities['time_expression'] ?? [];
     const values = entities['value_expression'] ?? [];
-
-    if (device_targets.length === 0) {
-      return null;
-    }
 
     const intent_family = inferIntentFamily(extraction.classifications);
     if (intent_family === null || intent_family === 'unsupported') {
       return null;
     }
+
+    // Routines are named values managed by Hearth, never physical device
+    // targets. GLiNER may emit a routine phrase in device_target because it
+    // is not a dedicated entity type, so only accept the explicit
+    // value_expression for this intent.
+    let resolved_targets = intent_family === 'routine-trigger'
+      ? (values.length === 1 ? [...values] : null)
+      : await this.expandRoomLampTargets(device_targets, rooms);
+    if (resolved_targets === null) return null;
+    if (resolved_targets.length === 0 && intent_family === 'set-scene' && rooms.length === 1) {
+      resolved_targets = rooms;
+    }
+    if (resolved_targets.length === 0) return null;
 
     const desired_values = buildDesiredValues(intent_family, values, extraction);
     if (desired_values === null) {
@@ -317,7 +363,7 @@ export class Interpreter {
     return {
       request_id,
       intent_family,
-      target_phrases: device_targets,
+      target_phrases: resolved_targets,
       exclusions,
       desired_values,
       temporal,
@@ -325,6 +371,125 @@ export class Interpreter {
       confidence: extraction.confidence,
       provenance,
     };
+  }
+
+  /**
+   * GLiNER2 may correctly identify "lamps" and a room without naming each
+   * device. Expand only an exact room and only individually named lights.
+   * The executor still resolves and authorizes every resulting target.
+   */
+  private async expandRoomLampTargets(
+    device_targets: ReadonlyArray<string>,
+    room_targets: ReadonlyArray<string>,
+  ): Promise<ReadonlyArray<string> | null> {
+    const generic = device_targets.length > 0 && device_targets.every((target) =>
+      /^(?:(?:all|every)\s+)?(?:the\s+)?(?:lamps?|lights?)$/i.test(target.trim()),
+    );
+    if (!generic) return device_targets;
+    if (room_targets.length !== 1) return null;
+
+    const snapshot = this.registry.snapshot?.();
+    if (!snapshot) return null;
+    const roomName = room_targets[0]!.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+    const rooms = snapshot.rooms.filter((room) =>
+      room.name.trim().toLocaleLowerCase().replace(/\s+/g, ' ') === roomName,
+    );
+    if (rooms.length !== 1) return null;
+
+    const memberIds = new Set(rooms[0]!.device_ids.map(String));
+    const roomLampEntityAllowlist = this.room_lamp_entity_allowlist;
+    const lampTargets = snapshot.devices.filter((device) =>
+      memberIds.has(String(device.canonical_id))
+      && device.load_type === 'light'
+      && (roomLampEntityAllowlist === undefined || device.provider_ids.some((provider) =>
+        provider.kind === 'ha' && roomLampEntityAllowlist.has(provider.entity_id),
+      ))
+      && (device_targets.some((target) => /lamp/i.test(target))
+        ? /\blamps?\b/i.test(device.friendly_name)
+        : /\b(?:light|lamp)s?\b/i.test(device.friendly_name)),
+    );
+    const names = lampTargets.map((device) => device.friendly_name);
+    if (names.length === 0 || new Set(names.map((name) => name.toLocaleLowerCase())).size !== names.length) {
+      return null;
+    }
+    return names;
+  }
+
+  /**
+   * Model output is a meaning proposal, never an authority source. Before a
+   * fallback can become executable, keep target names grounded in the request
+   * and reject common omissions that a resolver cannot recover safely.
+   */
+  private async isSafeFallbackProposal(
+    utterance: string,
+    proposal: IntentProposal,
+  ): Promise<boolean> {
+    if (proposal.unresolved_fields.length > 0) return false;
+    const text = normalizeForGrounding(utterance);
+    if (/\b(?:except|excluding|other than|but not)\b/.test(text)
+      && proposal.exclusions.length === 0) return false;
+
+    const actions = text.match(/\b(?:turn\s+(?:on|off)|switch\s+(?:on|off)|dim|brighten|increase|decrease|set\s+(?:the\s+)?brightness)\b/g) ?? [];
+    if (actions.length > 1) return false;
+    if (/\b(?:turn|switch)\s+on\b/.test(text)
+      && proposal.intent_family === 'set-state'
+      && proposal.desired_values.on !== true && proposal.desired_values.on !== 'on') return false;
+    if (/\b(?:turn|switch)\s+off\b/.test(text)
+      && proposal.intent_family === 'set-state'
+      && proposal.desired_values.on !== false && proposal.desired_values.on !== 'off') return false;
+    if (/\b(?:dim|brighten|increase|decrease|brightness)\b/.test(text)
+      && !['set-brightness-absolute', 'set-brightness-relative'].includes(proposal.intent_family)) return false;
+    if (proposal.intent_family.startsWith('set-brightness')
+      && !/\b(?:dim|brighten|increase|decrease|brightness|brighter|dimmer)\b/.test(text)) return false;
+
+    for (const phrase of proposal.target_phrases) {
+      const target = normalizeForGrounding(phrase);
+      if (target && text.includes(target)) continue;
+      const candidates = await this.registry.resolve(phrase);
+      const groundedAlias = candidates.some(({ device }) =>
+        device.aliases.some((alias) => {
+          const normalizedAlias = normalizeForGrounding(alias);
+          return normalizedAlias.length > 2 && text.includes(normalizedAlias);
+        }),
+      );
+      if (groundedAlias) continue;
+
+      // Permit only the explicit GLiNER2 room-lamp expansion, where the
+      // utterance names the complete room and lamps, and every result is a
+      // lamp in that exact room. General room-light expansion stays a
+      // clarification because it can hide mixed or ambiguous loads.
+      const snapshot = this.registry.snapshot?.();
+      const explicitRoomLampExpansion = snapshot !== undefined
+        && /\blamps\b/.test(text)
+        && snapshot.rooms.some((room) => {
+          const roomName = normalizeForGrounding(room.name);
+          if (!roomName || !text.includes(roomName)) return false;
+          const roomMembers = new Set(room.device_ids.map(String));
+          const roomLamps = snapshot.devices.filter((device) =>
+            roomMembers.has(String(device.canonical_id))
+            && device.load_type === 'light'
+            && /\blamp\b/i.test(device.friendly_name)
+            && (this.room_lamp_entity_allowlist === undefined || device.provider_ids.some((provider) =>
+              provider.kind === 'ha' && this.room_lamp_entity_allowlist!.has(provider.entity_id),
+            )),
+          );
+          const resultIsRoomLamp = candidates.some(({ device }) =>
+            roomMembers.has(String(device.canonical_id))
+            && device.load_type === 'light'
+            && /\blamp\b/i.test(device.friendly_name)
+            && (this.room_lamp_entity_allowlist === undefined || device.provider_ids.some((provider) =>
+              provider.kind === 'ha' && this.room_lamp_entity_allowlist!.has(provider.entity_id),
+            )),
+          );
+          const proposedNames = proposal.target_phrases.map(normalizeForGrounding).sort();
+          const completeRoomNames = roomLamps.map((device) => normalizeForGrounding(device.friendly_name)).sort();
+          return resultIsRoomLamp && completeRoomNames.length > 0
+            && proposedNames.length === completeRoomNames.length
+            && proposedNames.every((name, index) => name === completeRoomNames[index]);
+        });
+      if (!explicitRoomLampExpansion) return false;
+    }
+    return true;
   }
 
   private gliner2_checkpoint_id(): string {
@@ -360,6 +525,10 @@ export class Interpreter {
       recent_fresh_state: this.recent_fresh_state(),
     };
   }
+}
+
+function normalizeForGrounding(value: string): string {
+  return value.toLocaleLowerCase().normalize('NFKC').replace(/\s+/g, ' ').trim();
 }
 
 // =============================================================================
@@ -408,11 +577,47 @@ function composeProvenance(
           ? bonsai_proposal.provenance.adapter_id
           : 'unknown-bonsai-adapter',
     },
-    // Surface any unresolved fields the GLiNER2 partial flagged.
-    unresolved_fields: Array.from(
-      new Set([...bonsai_proposal.unresolved_fields, ...extraction.unresolved]),
-    ),
+    // Bonsai receives the full utterance and can resolve a GLiNER2 gap.
+    // Keep unresolved fields only when the composed proposal still lacks
+    // the corresponding information. Exclusions stay unresolved unless
+    // Bonsai explicitly returned at least one exclusion.
+    unresolved_fields: Array.from(new Set([
+      ...bonsai_proposal.unresolved_fields,
+      ...extraction.unresolved.filter((field) => !proposalSatisfiesField(bonsai_proposal, field)),
+    ])),
   };
+}
+
+function proposalSatisfiesField(proposal: IntentProposal, field: string): boolean {
+  switch (field) {
+    case 'intent':
+      return proposal.intent_family !== 'unsupported';
+    case 'device_target':
+    case 'room':
+    case 'group':
+      return proposal.target_phrases.length > 0;
+    case 'exclusion':
+      return proposal.exclusions.length > 0;
+    case 'time_expression':
+      return proposal.temporal !== null || typeof proposal.desired_values['until'] === 'string';
+    case 'value_expression':
+      switch (proposal.intent_family) {
+        case 'set-brightness-absolute':
+        case 'set-brightness-relative':
+          return typeof proposal.desired_values['brightness'] === 'number'
+            || typeof proposal.desired_values['brightness_delta'] === 'number';
+        case 'set-scene':
+          return typeof proposal.desired_values['scene_id'] === 'string';
+        case 'hold-until':
+          return typeof proposal.desired_values['until'] === 'string';
+        case 'routine-trigger':
+          return typeof proposal.desired_values['routine_name'] === 'string';
+        default:
+          return true;
+      }
+    default:
+      return false;
+  }
 }
 
 function errorMessage(err: unknown): string {
@@ -466,20 +671,20 @@ function buildDesiredValues(
       return { brightness: n };
     }
     case 'set-brightness-relative': {
-      // GLiNER2 doesn't reliably emit a delta in the entity array; we
-      // look for an explicit value expression. If absent, return null
-      // so the route escalates to Bonsai.
+      // GLiNER2 emits the size of a dim operation, while the executor
+      // contract represents dimming as a negative brightness delta.
       const n = extractNumber(values);
       if (n === null) return null;
-      return { brightness_delta: n };
+      return { brightness_delta: extraction.classifications.some((c) => c.label === 'dim_by') ? -Math.abs(n) : n };
     }
     case 'set-scene':
       // Scene name should appear in values. Without it, escalate.
       if (values.length === 0) return null;
       return { scene_id: values[0]! };
     case 'hold-until': {
-      if (values.length === 0) return null;
-      return { until: values[0]! };
+      const time = extraction.entities['time_expression']?.[0] ?? values[0];
+      if (time === undefined) return null;
+      return { until: time };
     }
     case 'routine-trigger':
       if (values.length === 0) return null;

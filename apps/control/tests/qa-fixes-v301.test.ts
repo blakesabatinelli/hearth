@@ -419,3 +419,70 @@ describe('QA #9: ops surface', () => {
     expect(pkg.scripts?.['integration']).toBeDefined();
   });
 });
+
+describe('contract builder preserves interpretation uncertainty and exclusions', () => {
+  it('refuses a proposal with unresolved fields', async () => {
+    const input = makeBuildInput('r-unresolved', 'living room lamp', {
+      unresolved_fields: ['exclusion'],
+    });
+    await expect(buildContract(input)).rejects.toThrow(/unresolved/i);
+  });
+
+  it('refuses unclassified and safety-sensitive load types even for admin', async () => {
+    const unknown = makeBuildInput('r-unknown-load', 'mystery switch', {
+      desired_values: { on: true },
+    });
+    await expect(buildContract(unknown)).rejects.toThrow(/load type unknown-switch is not enabled/i);
+  });
+
+  it('refuses non-actuating query proposals from the execution contract path', async () => {
+    const query = makeBuildInput('r-query-contract', 'living room lamp', {
+      intent_family: 'query-state',
+      desired_values: {},
+    });
+    await expect(buildContract(query)).rejects.toThrow(/requires its dedicated scheduler or query path/i);
+  });
+
+  it('refuses hold and routine proposals until their dedicated scheduler routes them', async () => {
+    const hold = makeBuildInput('r-hold-contract', 'living room lamp', {
+      intent_family: 'hold-until', desired_values: { on: true },
+    });
+    const routine = makeBuildInput('r-routine-contract', 'living room lamp', {
+      intent_family: 'routine-trigger', desired_values: { routine_name: 'morning' },
+    });
+    await expect(buildContract(hold)).rejects.toThrow(/requires its dedicated scheduler or query path/i);
+    await expect(buildContract(routine)).rejects.toThrow(/requires its dedicated scheduler or query path/i);
+  });
+
+  it('refuses brightness proposals for devices without brightness capability', async () => {
+    const fan = makeBuildInput('r-fan-brightness', 'bedroom fan', {
+      intent_family: 'set-brightness-absolute',
+      desired_values: { brightness: 20 },
+    });
+    await expect(buildContract(fan)).rejects.toThrow(/brightness is not a supported capability/i);
+  });
+
+  it('removes excluded canonical devices from the executable target set', async () => {
+    const input = makeBuildInput('r-exclusion', 'living room lamp', {
+      target_phrases: ['Living Room Lamp', 'Kitchen Lights'],
+      exclusions: ['Kitchen Lights'],
+    });
+    const { contract } = await buildContract(input);
+    expect(contract.targets.map((target) => target.canonical_id)).toEqual([
+      'dev-living-room-lamp',
+    ]);
+    expect(contract.exclusions).toEqual(['Kitchen Lights']);
+  });
+
+  it('refuses unresolved exclusions and an exclusion that removes every target', async () => {
+    const missing = makeBuildInput('r-missing-exclusion', 'living room lamp', {
+      exclusions: ['a device that does not exist'],
+    });
+    await expect(buildContract(missing)).rejects.toThrow(/exclusion/i);
+
+    const allExcluded = makeBuildInput('r-all-excluded', 'living room lamp', {
+      exclusions: ['Living Room Lamp'],
+    });
+    await expect(buildContract(allExcluded)).rejects.toThrow(/remove every executable target/i);
+  });
+});

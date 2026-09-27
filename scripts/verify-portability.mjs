@@ -24,7 +24,7 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
-const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '.pnpm-store', 'fixtures', 'eval/reports']);
+const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', '.pnpm-store', '.venv', 'fixtures', 'eval/reports']);
 // Files that legitimately contain the rule patterns themselves.
 const SELF_SKIP = new Set([
   'scripts/verify-portability.mjs',
@@ -67,7 +67,7 @@ function fs_read(p) {
 }
 
 const PATTERNS = [
-  ['macos-users-path', /\/Users\/(?!blake\.sabatinelli\/Desktop\/hearth)/],
+  ['macos-users-path', /\/Users\/(?!alpha\.sabatinelli\/Desktop\/hearth)/],
   ['private-ip-rfc1918', /\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)\b/],
   ['em-dash', /\u2014/],
   ['en-dash', /\u2013/],

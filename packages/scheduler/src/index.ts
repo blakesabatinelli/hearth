@@ -6,9 +6,11 @@
  * Contract through the same executor pipeline - the scheduler never
  * dispatches directly to the adapter.
  *
- * Persistence is SQLite-backed so the scheduler survives restarts. On
- * boot, `reconcileOnStartup()` re-evaluates every active schedule's next
- * fire time and skips already-fired triggers from a previous process.
+ * Persistence is SQLite-backed so the scheduler survives restarts. Cron
+ * fields use UTC. Only the current due minute is eligible, so missed
+ * occurrences are not caught up after a restart. A pending fire from a prior
+ * process is marked skipped because its outcome is uncertain and must not be
+ * replayed.
  *
  * Idempotency at the schedule level: each (schedule_id, fire_index) pair
  * produces a unique request_id when fired, so the executor's own
@@ -34,6 +36,8 @@ import type {
   RegistryOverlay as ExecutorRegistryOverlay,
 } from '@hearth/executor';
 import type { RegistryOverlay as HearthRegistryOverlay } from '@hearth/registry';
+import { cronMatchesAtMinuteInTimeZone, wallClockMinuteIdentity } from './cron.js';
+export { cronMatchesAtMinute, cronMatchesAtMinuteInTimeZone, isValidTimeZone, nextCronFire, wallClockMinuteIdentity } from './cron.js';
 
 // =============================================================================
 // Public schedule types
@@ -44,11 +48,13 @@ export type RestoreBehavior = 'restore-previous' | 'set-to-known-state';
 export type RoutineTriggerSpec = {
   readonly routine_id: string;
   readonly name: string;
-  readonly cron: string;            // standard 5-field cron: "min hour dom mon dow"
+  readonly cron: string;            // 5-field UTC cron: "min hour dom mon dow"
   readonly intent_family: IntentFamily;
   readonly target_phrases: ReadonlyArray<string>;
   readonly desired_values: Readonly<Record<string, number | string | boolean>>;
   readonly exclusions: ReadonlyArray<string>;
+  /** IANA local time zone. Older stored routines without it use UTC. */
+  readonly time_zone?: string;
   readonly role: ActorRole;        // server-side: who the routine acts as (admin|service|member)
   readonly enabled: boolean;
 };
@@ -85,10 +91,12 @@ export type ScheduleStore = {
 
   /** Atomic check + record. Returns true if the fire was recorded. */
   recordFireIfNew(fire: FireRecord): boolean;
+  /** Update the outcome of a previously reserved fire. */
+  updateFire(fire: FireRecord): boolean;
   listFiredForSchedule(schedule_id: string): ReadonlyArray<FireRecord>;
   lastFireIndex(schedule_id: string): number;
 
-  /** Used by reconcileOnStartup to find what needs catching up. */
+  /** Return enabled routines whose cron matches the current minute. */
   routinesToEvaluate(now: Date): ReadonlyArray<RoutineTriggerSpec>;
   holdsPastExpiry(now: Date): ReadonlyArray<HoldSpec>;
 };
@@ -103,71 +111,6 @@ export type ScheduleStore = {
  * Wildcards, lists (e.g. 1,3,5), ranges (e.g. 1-5), step (e.g. every 15).
  * Day-of-week: 0=Sun, 6=Sat.
  */
-export function nextCronFire(cron: string, from: Date): Date | null {
-  const fields = cron.trim().split(/\s+/);
-  if (fields.length !== 5) return null;
-  const min_s = fields[0]!;
-  const hr_s = fields[1]!;
-  const dom_s = fields[2]!;
-  const mon_s = fields[3]!;
-  const dow_s = fields[4]!;
-  const mins = parseField(min_s, 0, 59);
-  const hrs = parseField(hr_s, 0, 23);
-  const doms = parseField(dom_s, 1, 31);
-  const mons = parseField(mon_s, 1, 12);
-  const dows = parseField(dow_s, 0, 6);
-
-  if (!mins || !hrs || !doms || !mons || !dows) return null;
-
-  // Walk forward minute-by-minute up to ~4 years (to detect impossible cron
-  // expressions like Feb 30); 4y*366*24*60 = 2.1M iterations max.
-  let cur = new Date(from.getTime());
-  cur.setUTCSeconds(0, 0);
-  cur = new Date(cur.getTime() + 60_000); // strictly after `from`
-  const limit = cur.getTime() + (4 * 366 * 24 * 60 * 60 * 1000);
-  while (cur.getTime() < limit) {
-    if (
-      mons.has(cur.getUTCMonth() + 1) &&
-      doms.has(cur.getUTCDate()) &&
-      (dow_matches(dows, cur)) &&
-      hrs.has(cur.getUTCHours()) &&
-      mins.has(cur.getUTCMinutes())
-    ) {
-      return cur;
-    }
-    cur = new Date(cur.getTime() + 60_000);
-  }
-  return null;
-}
-
-function parseField(spec: string, min: number, max: number): Set<number> | null {
-  const out = new Set<number>();
-  for (const part of spec.split(',')) {
-    const m = part.match(/^(\*|(\d+)(-(\d+))?)(?:\/(\d+))?$/);
-    if (!m) return null;
-    let lo: number;
-    let hi: number;
-    if (m[1] === '*') {
-      lo = min;
-      hi = max;
-    } else {
-      lo = Number(m[2]);
-      hi = m[4] !== undefined ? Number(m[4]) : lo;
-    }
-    const step = m[5] !== undefined ? Number(m[5]) : 1;
-    if (lo < min || hi > max || step < 1) return null;
-    for (let v = lo; v <= hi; v += step) out.add(v);
-  }
-  return out;
-}
-
-function dow_matches(dows: Set<number>, d: Date): boolean {
-  // JS getUTCDay: 0=Sun..6=Sat. Cron dow field also uses 0=Sun.
-  // `*` should match any day. We treat dom OR dow as OR (cron POSIX
-  // semantics): if both are restricted to specific values, either matches.
-  return dows.has(d.getUTCDay());
-}
-
 // =============================================================================
 // In-memory store
 // =============================================================================
@@ -201,14 +144,22 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   public recordFireIfNew(fire: FireRecord): boolean {
-    const key = `${fire.schedule_id}:${fire.fire_id}`;
+    const key = `${fire.schedule_id}\u0000${fire.fire_id}`;
     if (this.fire_keys.has(key)) return false;
     this.fire_keys.add(key);
-    this.fires.set(fire.fire_id, fire);
+    this.fires.set(key, fire);
+    return true;
+  }
+  public updateFire(fire: FireRecord): boolean {
+    const key = `${fire.schedule_id}\u0000${fire.fire_id}`;
+    if (!this.fires.has(key)) return false;
+    this.fires.set(key, fire);
     return true;
   }
   public listFiredForSchedule(schedule_id: string): ReadonlyArray<FireRecord> {
-    return Array.from(this.fires.values()).filter((f) => f.schedule_id === schedule_id);
+    return Array.from(this.fires.values())
+      .filter((f) => f.schedule_id === schedule_id)
+      .sort((a, b) => a.fired_at.localeCompare(b.fired_at));
   }
   public lastFireIndex(schedule_id: string): number {
     const fires = this.listFiredForSchedule(schedule_id);
@@ -216,10 +167,9 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return Math.max(...fires.map((f) => Number(f.fire_id.split(':').pop() ?? -1)));
   }
   public routinesToEvaluate(now: Date): ReadonlyArray<RoutineTriggerSpec> {
+    const current_minute = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
     return Array.from(this.routines.values()).filter((r) => {
-      if (!r.enabled) return false;
-      const next = nextCronFire(r.cron, now);
-      return next !== null;
+      return r.enabled && cronMatchesAtMinuteInTimeZone(r.cron, current_minute, r.time_zone ?? 'UTC');
     });
   }
   public holdsPastExpiry(now: Date): ReadonlyArray<HoldSpec> {
@@ -228,6 +178,8 @@ export class InMemoryScheduleStore implements ScheduleStore {
     );
   }
 }
+
+export { SqliteScheduleStore } from './sqlite-store.js';
 
 // =============================================================================
 // Scheduler
@@ -294,17 +246,15 @@ export class Scheduler {
 
     // Routines.
     for (const routine of this.store.routinesToEvaluate(now)) {
-      const next = nextCronFire(routine.cron, now);
-      if (!next) continue;
-      // Find fire_index such that fire time matches `next`.
-      const fire_index = computeFireIndex(routine.cron, next);
+      const due = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
+      const fire_index = computeFireIndex(routine.cron, due, routine.time_zone ?? 'UTC');
       if (fire_index < 0) continue;
       const fire_id = `${routine.routine_id}:${fire_index}`;
       if (!this.store.recordFireIfNew({
         fire_id,
         schedule_id: routine.routine_id,
         schedule_kind: 'routine',
-        fired_at: next.toISOString(),
+        fired_at: due.toISOString(),
         contract_id: null,
         status: 'pending',
         error: null,
@@ -314,12 +264,25 @@ export class Scheduler {
         const contract = await this.buildContractForRoutine(routine, fire_index);
         const receipt = await this.executor.dispatch(contract);
         fired += 1;
-        // (Status bookkeeping of the fire record isn't persisted here in the
-        // in-memory store; the receipt + executor state is the source of truth.)
-        void receipt;
+        this.store.updateFire({
+          fire_id,
+          schedule_id: routine.routine_id,
+          schedule_kind: 'routine',
+          fired_at: due.toISOString(),
+          contract_id: receipt.contract_id,
+          status: 'dispatched',
+          error: null,
+        });
       } catch (err) {
-        // Swallow & continue; the fire is recorded as 'failed' for observability.
-        void err;
+        this.store.updateFire({
+          fire_id,
+          schedule_id: routine.routine_id,
+          schedule_kind: 'routine',
+          fired_at: due.toISOString(),
+          contract_id: `sched_${routine.routine_id}-${fire_index}`,
+          status: 'failed',
+          error: (err as Error).message,
+        });
       }
     }
 
@@ -339,11 +302,28 @@ export class Scheduler {
 
       try {
         const contract = await this.buildContractForHold(hold);
-        await this.executor.dispatch(contract);
+        const receipt = await this.executor.dispatch(contract);
         this.store.removeHold(hold.hold_id);
         fired += 1;
+        this.store.updateFire({
+          fire_id,
+          schedule_id: hold.hold_id,
+          schedule_kind: 'hold',
+          fired_at: new Date(this.clock.now()).toISOString(),
+          contract_id: receipt.contract_id,
+          status: 'dispatched',
+          error: null,
+        });
       } catch (err) {
-        void err;
+        this.store.updateFire({
+          fire_id,
+          schedule_id: hold.hold_id,
+          schedule_kind: 'hold',
+          fired_at: new Date(this.clock.now()).toISOString(),
+          contract_id: `sched_${hold.hold_id}-restore`,
+          status: 'failed',
+          error: (err as Error).message,
+        });
       }
     }
 
@@ -351,13 +331,36 @@ export class Scheduler {
   }
 
   /**
-   * Recover from a previous process's tick. Idempotent: re-records fires
-   * that already happened (the executor's idempotency layer rejects them).
+   * Recover from a previous process's tick without replaying uncertain work.
    */
   public async reconcileOnStartup(): Promise<void> {
-    // For routines: walk forward from last_fire_at and dispatch any missed
-    // ticks. For holds: any past-expiry holds have already been acted on
-    // by the previous process; we re-evaluate to be safe.
+    // A pending record means a prior process reserved the occurrence but did
+    // not persist its final outcome. The executor may have sent it, so never
+    // replay it blindly. Mark it uncertain and allow later cron occurrences.
+    for (const routine of this.store.listRoutines()) {
+      for (const fire of this.store.listFiredForSchedule(routine.routine_id)) {
+        if (fire.status === 'pending') {
+          this.store.updateFire({
+            ...fire,
+            status: 'skipped',
+            error: 'prior dispatch outcome unknown; recovery suppressed replay',
+          });
+        }
+      }
+    }
+    for (const hold of this.store.holdsPastExpiry(new Date(this.clock.now()))) {
+      for (const fire of this.store.listFiredForSchedule(hold.hold_id)) {
+        if (fire.status === 'pending') {
+          this.store.updateFire({
+            ...fire,
+            status: 'skipped',
+            error: 'prior restore outcome unknown; recovery suppressed replay',
+          });
+        }
+      }
+    }
+    // Process only an occurrence due in this UTC minute; offline occurrences
+    // are intentionally not replayed after restart.
     await this.tick();
   }
 
@@ -497,8 +500,9 @@ export class Scheduler {
 
 // Compute a stable fire_index from a cron expression + fire time. We use
 // the unix-epoch minute of the fire (good enough for daily/weekly cron).
-function computeFireIndex(cron: string, fire_at: Date): number {
-  return Math.floor(fire_at.getTime() / 60_000);
+function computeFireIndex(cron: string, fire_at: Date, time_zone = 'UTC'): number {
+  if (!cronMatchesAtMinuteInTimeZone(cron, fire_at, time_zone)) return -1;
+  return wallClockMinuteIdentity(fire_at, time_zone) ?? -1;
 }
 
 function defaultState(_canonical_id: CanonicalId): Record<string, number | string | boolean> {

@@ -150,6 +150,62 @@ describe('GrammarParser', () => {
     expect(r.proposal.temporal).toBeNull();
   });
 
+  it('read-only state questions resolve without a model', async () => {
+    const result = await parser.parse('Is the lamp currently running?', 'req-query-state');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.proposal.intent_family).toBe('query-state');
+    expect(result.proposal.target_phrases).toEqual(['Living Room Lamp']);
+    expect(result.proposal.provenance).toMatchObject({ source: 'grammar', matched_rule: 'query-state@1' });
+  });
+
+  it('turn on the master bedroom lamps targets only individually named room lamps', async () => {
+    const bedroom = room({ id: 'master-bedroom', name: 'Master Bedroom', device_ids: ['alpha-lamp', 'beta-lamp', 'bedroom-group', 'candle'] });
+    const bedroomRegistry = makeRegistry([
+      device({ id: 'alpha-lamp', friendly_name: "alpha's Lamp", room_id: bedroom.room_id }),
+      device({ id: 'beta-lamp', friendly_name: "beta's Lamp", room_id: bedroom.room_id }),
+      device({ id: 'bedroom-group', friendly_name: 'Master Bedroom', room_id: bedroom.room_id }),
+      device({ id: 'candle', friendly_name: 'Bedroom Candle', room_id: bedroom.room_id }),
+    ], [bedroom]);
+    const bedroomParser = new GrammarParser({ registry: bedroomRegistry });
+
+    const result = await bedroomParser.parse('Turn on the master bedroom lamps', 'req-bedroom-lamps');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.proposal.target_phrases).toEqual(["alpha's Lamp", "beta's Lamp"]);
+    expect(result.proposal.desired_values.on).toBe(true);
+    expect(result.proposal.provenance).toMatchObject({ source: 'grammar', matched_rule: 'room-lamps@1' });
+  });
+
+  it('room lamp expansion honors exact approved HA entities when names are duplicated', async () => {
+    const bedroom = room({
+      id: 'master-bedroom',
+      name: 'Master Bedroom',
+      device_ids: ['master_bedroom_blake_lamp', 'master_bedroom_blake_lamp_2', 'master_bedroom_jinna_lamp', 'master_bedroom_jinna_lamp_2'],
+    });
+    const bedroomRegistry = makeRegistry([
+      device({ id: 'master_bedroom_blake_lamp', friendly_name: 'alpha lamp', room_id: bedroom.room_id }),
+      device({ id: 'master_bedroom_blake_lamp_2', friendly_name: 'alpha lamp', room_id: bedroom.room_id }),
+      device({ id: 'master_bedroom_jinna_lamp', friendly_name: 'beta lamp', room_id: bedroom.room_id }),
+      device({ id: 'master_bedroom_jinna_lamp_2', friendly_name: 'beta lamp', room_id: bedroom.room_id }),
+    ], [bedroom]);
+    const bedroomParser = new GrammarParser({
+      registry: bedroomRegistry,
+      room_lamp_entity_allowlist: new Set([
+        'light.master_bedroom_blake_lamp',
+        'light.master_bedroom_jinna_lamp',
+      ]),
+    });
+
+    const result = await bedroomParser.parse('Turn on the master bedroom lamps', 'req-allowlisted-room-lamps');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.proposal.target_phrases).toEqual(['alpha lamp', 'beta lamp']);
+    expect(result.proposal.provenance).toMatchObject({ source: 'grammar', matched_rule: 'room-lamps@1' });
+  });
+
   it('dim by 10 percent -> set-brightness-relative with delta -10', async () => {
     const r = await parser.parse('dim the lamp by 10 percent', 'req-2');
     expect(r.ok).toBe(true);

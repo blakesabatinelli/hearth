@@ -100,8 +100,15 @@ describe('AC-14 session + CSRF', () => {
 
   it('tampered cookie fails verify (no session returned)', async () => {
     const sess = await createSession(tc.app);
-    // Replace last char of the cookie value to invalidate the HMAC
-    const tampered = sess.cookie.slice(0, -1) + (sess.cookie.endsWith('A') ? 'B' : 'A');
+    // Flip an actual decoded MAC byte. Replacing the last character of a
+    // base64url cookie can modify only unused padding bits on some values.
+    const cookie_value = sess.cookie.slice(sess.cookie.indexOf('=') + 1);
+    const decoded = Buffer.from(cookie_value, 'base64url').toString('utf8');
+    const [session_id, mac] = decoded.split('.');
+    const mac_bytes = Buffer.from(mac!, 'base64url');
+    mac_bytes[0] = mac_bytes[0]! ^ 1;
+    const tampered_value = Buffer.from(`${session_id}.${mac_bytes.toString('base64url')}`).toString('base64url');
+    const tampered = `hearth_session=${tampered_value}`;
     const res = await tc.app.inject({
       method: 'GET',
       url: '/v1/devices',
@@ -188,4 +195,19 @@ describe('AC-15 server-derived principal fields', () => {
     const body = res.json() as { error: { code: string } };
     expect(body.error.code).toBe('forbidden_field');
   });
+
+  it.each(['actor_id', 'role', 'policy', 'allowed_devices', 'expiry_at', 'retry_limit'])(
+    'rejects model/client authority field %s before interpretation',
+    async (field) => {
+      const sess = await createSession(tc.app);
+      const res = await tc.app.inject({
+        method: 'POST',
+        url: '/v1/interpret',
+        headers: { cookie: sess.cookie, ...csrfHeaders(sess.csrf) },
+        payload: { utterance: 'turn on the lamp', payload: { [field]: 'forged' } },
+      });
+      expect(res.statusCode).toBe(400);
+      expect((res.json() as { error: { code: string } }).error.code).toBe('forbidden_field');
+    },
+  );
 });

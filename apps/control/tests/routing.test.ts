@@ -36,7 +36,7 @@ describe('AC-31 routing decisions', () => {
     expect(body.decision.proposal.provenance.source).toBe('grammar');
   });
 
-  it('grammar reject -> needs_gliner2 (MockGliner2 returns ready)', async () => {
+  it('grammar rejects a compound request and fallback asks for clarification', async () => {
     const sess = await createSession(tc.app);
     // "brighten the lamp by 20 percent" might be grammar-rejected depending
     // on the grammar's coverage; force a path where GLiNER2 is the resolver.
@@ -51,13 +51,9 @@ describe('AC-31 routing decisions', () => {
     const body = res.json() as {
       decision: { outcome: string; utterance?: string; proposal?: { provenance: { source: string } } };
     };
-    // Two-action conjunction is rejected by the grammar; MockGliner2 then
-    // resolves it. Either ready_for_contract (from GLiNER2) or needs_bonsai
-    // is acceptable per the routing contract.
-    expect(['ready_for_contract', 'needs_bonsai']).toContain(body.decision.outcome);
-    if (body.decision.outcome === 'ready_for_contract') {
-      expect(body.decision.proposal?.provenance.source).toBe('gliner2');
-    }
+    // Two-action conjunction is rejected by grammar and the safe fallback
+    // boundary refuses to reduce it to a single action.
+    expect(body.decision.outcome).toBe('needs_clarification');
   });
 
   it('grammar reject + GLiNER2 partial + bonsai stub -> ready_for_contract composed provenance', async () => {

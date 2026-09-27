@@ -1,8 +1,16 @@
 # Deployment
 
-This file is the deployment-side reference for Hearth v3.0. It documents
-what is required to take a fresh Debian/Ubuntu box and turn it into a
-Hearth host.
+This file documents a local Docker Compose development stack. It is not the
+production remote-access setup for the active household host. For the live
+Apple Silicon setup, follow `docs/macos-host-setup.md` and the iPad/Tailscale
+plan in `docs/plan-ipad-full-activation.md`.
+
+The Compose profile defaults to fixture mode. Its PWA is a development server
+with an internal API proxy, and both published ports are bound to host
+loopback. Do not expose the Compose ports to a LAN or use the Compose PWA as a
+Tailscale Serve target. Production remote access must use the same-origin
+gateway in `apps/web/server.mjs`, bound to host loopback and restricted to an
+allowlisted Tailscale identity.
 
 ## Required machine resources
 
@@ -57,8 +65,9 @@ docker compose --profile with-extract up -d
 ```
 
 Services:
-- `hearth-control`: API on `:8787`.
-- `hearth-web`: PWA on `:5173`.
+- `hearth-control`: fixture API on host loopback `127.0.0.1:8787`.
+- `hearth-web`: development PWA with proxy to the internal control service,
+  published on host loopback `127.0.0.1:5173`.
 - `hearth-extract`: GLiNER2 sidecar on `:8765` (only with `--profile with-extract`).
 
 ## Verify
@@ -83,21 +92,16 @@ Requires that `docker compose` has previously taken a `hearth:previous`
 tag (the default `docker compose up -d` does not, by design - use
 `./scripts/upgrade.sh` which takes care of it explicitly).
 
-## What is NOT yet validated
+## Current household host status
 
-The current release, Hearth v3.0, ships with comprehensive fixture-mode
-tests (183/183) but **has not been validated against the following
-real-world resources** that exist only on the deployment machine:
+The active Apple Silicon host has live Home Assistant, OpenClaw, Bonsai,
+GLiNER2, control, and PWA services. The controller discovers 56 HA records;
+only two physically verified lamp entities are enabled for actuation. Stage 1
+fixture checks and the Stage 3 frozen synthetic corpus pass. See `STATE.md` for
+current evidence and `docs/gates.md` for gate definitions.
 
-- A live Home Assistant instance with real devices.
-- Real HA device discovery, entity-id resolution, and HA token auth.
-- The OpenClaw Gateway (external-app integration per OpenClaw docs).
-- Live Bonsai 27B inference with the actual GGUF weights.
-- Live GLiNER2 inference with `fastino/gliner2.5-base-v1` checkpoint.
-- A labeled evaluation corpus for ambiguity-pruning quality scores.
-- A user-supplied allowlist (registry must be populated from HA at deploy time).
-
-Before declaring v3.0 production-ready, run the Stage 8 validation
-sequence described in `HEARTH_HERMES_DEVELOPMENT_PLAN.md` section 11.
-The harness is structurally ready for that work; the work itself
-requires the deployment environment and the labeled evaluation corpus.
+Household expansion still requires physical device identity, route, load, and
+feedback review. Tailscale is not installed on the host because its installer
+needs local administrator authorization and VPN configuration approval. Do
+not interpret the fixture Compose profile as live-device or remote-access
+validation.

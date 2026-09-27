@@ -9,12 +9,15 @@
  *   HEARTH_PORT                  listen port (default 8787)
  *   HEARTH_HOST                  listen host (default 0.0.0.0)
  *   HEARTH_SESSION_SECRET        HMAC secret for session cookies (REQUIRED in prod)
- *   HEARTH_SQLITE_PATH           path to executor SQLite database (default :memory:)
+ *   HEARTH_SQLITE_PATH           shared execution and schedule database (default :memory:)
  *   HEARTH_FIXTURE_MODE          "1" (default, safe) or "0" for live HA. Setting
  *                                "0" requires HEARTH_HA_URL and HEARTH_HA_TOKEN,
  *                                else the service refuses to start (fail closed).
  *   HEARTH_HA_URL                base URL of Home Assistant (live mode only).
  *   HEARTH_HA_TOKEN              long-lived HA access token (live mode only).
+ *   HEARTH_HA_ACTUATION_ALLOWLIST comma-separated exact HA entity IDs
+ *                                approved for executor dispatch. Empty means
+ *                                discovery and state reads only.
  *   HEARTH_EXTRACT_URL           base URL of the GLiNER2 sidecar. If set, the
  *                                interpreter uses the HTTP provider; if unset,
  *                                the bundled mock provider runs in fixture mode.
@@ -45,25 +48,43 @@ import {
 import { RegistryOverlay } from '@hearth/registry';
 import {
   OpenClawBonsaiProvider,
+  probeOpenClawGateway,
   OpenClawPermanentError,
   OpenClawPinError,
   OpenClawTransientError,
 } from '@hearth/openclaw-adapter';
 import { wireControl } from './wiring.js';
-import { Scheduler, InMemoryScheduleStore, type SchedulerOptions } from '@hearth/scheduler';
+import { Scheduler, InMemoryScheduleStore, SqliteScheduleStore, type ScheduleStore, type SchedulerOptions } from '@hearth/scheduler';
 
-async function makeStore(sqlite_path: string): Promise<ExecutionStore> {
+type RuntimeStores = {
+  readonly execution: ExecutionStore;
+  readonly schedules: ScheduleStore;
+  readonly close: () => void;
+};
+
+async function makeRuntimeStores(sqlite_path: string): Promise<RuntimeStores> {
   if (sqlite_path === ':memory:') {
-    return new InMemoryExecutionStore();
+    return {
+      execution: new InMemoryExecutionStore(),
+      schedules: new InMemoryScheduleStore(),
+      close: () => undefined,
+    };
   }
-  // Dynamic import so better-sqlite3 is not required when running with
-  // the default in-memory store (faster dev boot, no native binding).
-  type DatabaseCtor = new (filename: string) => unknown;
+
+  const { mkdir } = await import('node:fs/promises');
+  const { dirname } = await import('node:path');
+  await mkdir(dirname(sqlite_path), { recursive: true });
+  type DatabaseCtor = new (filename: string) => import('better-sqlite3').Database;
   const mod = await import('better-sqlite3') as unknown as { default?: DatabaseCtor };
   const Database = (mod.default ?? (mod as unknown as DatabaseCtor));
-  const db = new Database(sqlite_path) as import('better-sqlite3').Database;
+  const db = new Database(sqlite_path);
+  db.pragma('busy_timeout = 5000');
   const { SqliteExecutionStore } = await import('@hearth/executor');
-  return new SqliteExecutionStore({ db });
+  return {
+    execution: new SqliteExecutionStore({ db }),
+    schedules: new SqliteScheduleStore({ db }),
+    close: () => db.close(),
+  };
 }
 
 /**
@@ -83,6 +104,7 @@ async function resolveAdapter(): Promise<{
   registry: RegistryOverlay;
   mode: 'fixture' | 'live';
   ha_url?: string;
+  actuation_allowlist?: ReadonlySet<string>;
 }> {
   const fixture_mode = (process.env.HEARTH_FIXTURE_MODE ?? '1') !== '0';
 
@@ -108,7 +130,13 @@ async function resolveAdapter(): Promise<{
     throw new Error('HEARTH_FIXTURE_MODE=0 but HEARTH_HA_TOKEN is not set; refusing to start');
   }
 
-  const live = new LiveHAAdapter({ base_url: ha_url, token: ha_token });
+  const actuation_allowlist = new Set(
+    (process.env.HEARTH_HA_ACTUATION_ALLOWLIST ?? '')
+      .split(',')
+      .map((entity_id) => entity_id.trim())
+      .filter(Boolean),
+  );
+  const live = new LiveHAAdapter({ base_url: ha_url, token: ha_token, actuation_allowlist });
   // Probe HA before binding; fail closed if the token is bad or HA is
   // unreachable. The probe is a single /api/ call; no retries, no
   // backoff; the operator should see the error immediately.
@@ -124,7 +152,14 @@ async function resolveAdapter(): Promise<{
   // ask for it keep working); the live one is set as active.
   const fixture = loadDefaultFixture();
   const pool = new HAConnectionPool(fixture, 'ha', live);
-  return { adapter: pool.getActive(), pool, registry, mode: 'live', ha_url };
+  return {
+    adapter: pool.getActive(),
+    pool,
+    registry,
+    mode: 'live',
+    ha_url,
+    actuation_allowlist,
+  };
 }
 
 /**
@@ -178,15 +213,19 @@ async function main(): Promise<void> {
   console.log(`[hearth-control] adapter mode: ${resolved.mode}${resolved.ha_url ? ` (${resolved.ha_url})` : ''}`);
   const { adapter, registry } = resolved;
 
-  const store = await makeStore(sqlite_path);
+  const stores = await makeRuntimeStores(sqlite_path);
   const clock = new SystemClock();
 
   const wired = await wireControl({
     registry,
     adapter,
-    store,
+    store: stores.execution,
+    schedule_store: stores.schedules,
     clock,
     session_secret,
+    ...(resolved.actuation_allowlist !== undefined
+      ? { live_ha_actuation_allowlist: resolved.actuation_allowlist }
+      : {}),
     ...(extract_url ? { gliner2_http_url: extract_url } : {}),
     ...resolveBonsaiProvider(),
   });
@@ -201,14 +240,8 @@ async function main(): Promise<void> {
     console.error('[hearth-control] reconcileOnStartup failed:', (err as Error).message);
   }
 
-  // v3.0.1: start the scheduler. In-memory only on the current store; the
-  // production deployment will swap in a SQLite-backed ScheduleStore
-  // pointing at HEARTH_SCHEDULE_DB. The scheduler picks up the live
-  // state_version through the adapter.handle getState() lookup, so the
-  // executor's stale-context check has the comparison it needs.
-  const sched_store = new InMemoryScheduleStore();
   const sched_state: SchedulerOptions = {
-    store: sched_store,
+    store: stores.schedules,
     executor: wired.executor,
     registry,
     executor_registry: wired.executor_registry,
@@ -223,9 +256,10 @@ async function main(): Promise<void> {
     },
   };
   const scheduler = new Scheduler(sched_state);
+  await scheduler.reconcileOnStartup();
   scheduler.start();
   // eslint-disable-next-line no-console
-  console.log('[hearth-control] scheduler started (in-memory store, 30s tick)');
+  console.log(`[hearth-control] scheduler started (${sqlite_path === ':memory:' ? 'in-memory' : 'SQLite'} store, 30s tick)`);
 
   await wired.app.listen({ port, host });
 
@@ -234,7 +268,9 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[hearth-control] received ${signal}, shutting down`);
     try {
+      scheduler.stop();
       await wired.app.close();
+      stores.close();
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[hearth-control] shutdown error:', (err as Error).message);
@@ -394,11 +430,7 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
     }
   }
 
-  // Check 7: OpenClaw adapter wiring (item 8 doctor check).
-  // The OpenClaw URL is loopback-only. If set, probe /agent/turn with a
-  // 401-style request to confirm the Gateway is alive (it should
-  // return 401 or 400, never connection-refused). If unset, the
-  // interpreter falls back to grammar+GLiNER2 only, which is OK.
+  // Check 7: verify the actual Gateway WebSocket handshake used by Hearth.
   const openclaw_url = process.env.HEARTH_OPENCLAW_URL ?? '';
   const openclaw_token = process.env.HEARTH_GATEWAY_TOKEN ?? '';
   if (openclaw_url) {
@@ -424,36 +456,12 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
       });
     } else {
       try {
-        // An OPTIONS or fake POST will tell us the gateway is alive.
-        // We expect 401/400/404 from any real endpoint.
-        const res = await fetch(`${openclaw_url.replace(/\/$/, '')}/agent/turn`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${openclaw_token}`,
-          },
-          body: JSON.stringify({ probe: true }),
+        await probeOpenClawGateway(openclaw_url, openclaw_token);
+        checks.push({
+          name: 'openclaw-reachable',
+          status: 'PASS',
+          detail: `${openclaw_url} accepted Hearth's pinned Gateway WebSocket handshake`,
         });
-        if (res.status === 404) {
-          checks.push({
-            name: 'openclaw-reachable',
-            status: 'WARN',
-            detail: `${openclaw_url}/agent/turn returned 404; verify the Gateway version (expected 2026.9.6)`,
-          });
-        } else if (res.status >= 500) {
-          checks.push({
-            name: 'openclaw-reachable',
-            status: 'FAIL',
-            detail: `${openclaw_url}/agent/turn returned ${res.status}`,
-          });
-        } else {
-          // 400/401/403 all mean: gateway is alive, accepts this URL.
-          checks.push({
-            name: 'openclaw-reachable',
-            status: 'PASS',
-            detail: `${openclaw_url}/agent/turn responded (${res.status}); token accepted`,
-          });
-        }
       } catch (err) {
         checks.push({
           name: 'openclaw-reachable',
@@ -466,7 +474,7 @@ export async function doctor(): Promise<{ pass: number; warn: number; fail: numb
     checks.push({
       name: 'openclaw-reachable',
       status: 'WARN',
-      detail: 'HEARTH_OPENCLAW_URL not set; bonsai provider disabled (grammar + GLiNER2 only)',
+      detail: 'HEARTH_OPENCLAW_URL not set; Bonsai provider disabled (grammar + GLiNER2 only)',
     });
   }
 

@@ -4,19 +4,24 @@
  * Hash routes look like `#/`, `#/ask`, `#/history`. We listen to
  * `hashchange`. Empty hash (no `#` or just `#`) is treated as `home`.
  *
- * This is intentionally small: no react-router, no path parsing. The
- * Stage 4 PWA has three screens; we don't need nested routes.
+ * This is intentionally small: no react-router, no path parsing. Hearth
+ * screens remain flat routes so the installed PWA can navigate reliably.
  */
 
 import { useEffect, useState } from 'react';
 
-export type RouteName = 'home' | 'ask' | 'history';
+export type RouteName = 'home' | 'rooms' | 'favorites' | 'ask' | 'routines' | 'attention' | 'history' | 'devices';
 
 const ROUTES: ReadonlyMap<string, RouteName> = new Map<string, RouteName>([
   ['', 'home'],
   ['home', 'home'],
+  ['rooms', 'rooms'],
+  ['favorites', 'favorites'],
   ['ask', 'ask'],
+  ['routines', 'routines'],
+  ['attention', 'attention'],
   ['history', 'history'],
+  ['devices', 'devices'],
 ]);
 
 export function parseHash(hash: string): RouteName {

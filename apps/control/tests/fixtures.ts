@@ -8,6 +8,8 @@ import { InMemoryExecutionStore } from '@hearth/executor';
 import { FakeHAAdapter, loadDefaultFixture } from '@hearth/ha-adapter';
 import { RegistryOverlay as HearthRegistryOverlay } from '@hearth/registry';
 import type { HomeAssistantAdapter } from '@hearth/contracts';
+import type { BonsaiProvider, ExtractionProvider } from '@hearth/contracts';
+import { InMemoryScheduleStore } from '@hearth/scheduler';
 import { wireControl, type WiredControl } from '../src/wiring.js';
 
 export type TestControl = WiredControl & {
@@ -18,10 +20,14 @@ export type TestControl = WiredControl & {
   hearth_registry: HearthRegistryOverlay;
   /** The fake HA adapter, exposed so tests can verify state-version lookups. */
   adapter: HomeAssistantAdapter;
+  schedule_store: InMemoryScheduleStore;
 };
 
 export async function buildTestControl(opts?: {
   session_secret?: string;
+  live_ha_actuation_allowlist?: ReadonlySet<string>;
+  gliner2?: ExtractionProvider | null;
+  bonsai?: BonsaiProvider | null;
 }): Promise<TestControl> {
   const fixture = loadDefaultFixture();
   const registry = new HearthRegistryOverlay({
@@ -32,14 +38,21 @@ export async function buildTestControl(opts?: {
   });
   const adapter = new FakeHAAdapter(fixture);
   const store = new InMemoryExecutionStore();
+  const schedule_store = new InMemoryScheduleStore();
   const clock = new SystemClock();
 
   const wired = await wireControl({
     registry,
     adapter,
     store,
+    schedule_store,
     clock,
     session_secret: opts?.session_secret ?? 'test-secret',
+    ...(opts?.gliner2 !== undefined ? { gliner2: opts.gliner2 } : {}),
+    ...(opts?.bonsai !== undefined ? { bonsai: opts.bonsai } : {}),
+    ...(opts?.live_ha_actuation_allowlist !== undefined
+      ? { live_ha_actuation_allowlist: opts.live_ha_actuation_allowlist }
+      : {}),
   });
 
   const injectCookie = (session_id: string): string =>
@@ -62,6 +75,7 @@ export async function buildTestControl(opts?: {
     tearDown,
     hearth_registry: registry,
     adapter,
+    schedule_store,
   };
 }
 
